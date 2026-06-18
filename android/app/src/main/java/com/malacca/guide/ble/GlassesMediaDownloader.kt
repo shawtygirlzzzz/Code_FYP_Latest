@@ -67,16 +67,19 @@ object GlassesMediaDownloader {
 
     /**
      * Finds the glasses' HTTP server on the WiFi Direct subnet. Tries the
-     * preferred IP first, then probes 192.168.49.2..120 concurrently.
+     * supplied candidate IPs (in priority order) first, then probes
+     * 192.168.49.2..120 concurrently as a last resort.
      */
-    suspend fun discoverGlassesIp(preferredIp: String?): String? = withContext(Dispatchers.IO) {
+    suspend fun discoverGlassesIp(preferred: List<String>): String? = withContext(Dispatchers.IO) {
         val probeClient = OkHttpClient.Builder()
             .connectTimeout(1500, TimeUnit.MILLISECONDS)
             .readTimeout(1500, TimeUnit.MILLISECONDS)
             .build()
-        if (!preferredIp.isNullOrBlank() && probe(probeClient, preferredIp)) {
-            Log.d(TAG, "discoverGlassesIp: found at preferred $preferredIp")
-            return@withContext preferredIp
+        for (ip in preferred) {
+            if (ip.isNotBlank() && probe(probeClient, ip)) {
+                Log.d(TAG, "discoverGlassesIp: found at candidate $ip")
+                return@withContext ip
+            }
         }
         val found = coroutineScope {
             (2..120).map { i ->
@@ -86,7 +89,7 @@ object GlassesMediaDownloader {
                 }
             }.awaitAll().firstOrNull { it != null }
         }
-        Log.d(TAG, "discoverGlassesIp: result=$found")
+        Log.d(TAG, "discoverGlassesIp: probe-sweep result=$found")
         found
     }
 

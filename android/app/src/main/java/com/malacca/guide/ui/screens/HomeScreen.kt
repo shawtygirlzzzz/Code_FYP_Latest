@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -173,19 +174,23 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
         scope.launch {
             val bytes = GlassesManager.takePhoto()
             val bitmap = bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+            capturing = false
             if (bitmap != null) {
+                Log.d("ImagePipeline", "captureFromGlassesThen: bitmap ${bitmap.width}x${bitmap.height}")
                 viewModel.storeBitmap(scaleBitmap(bitmap, 1280))
+                navigate()
+            } else {
+                Log.e("ImagePipeline", "captureFromGlassesThen: capture failed, bitmap null")
+                Toast.makeText(context, "Image capture failed, try again.", Toast.LENGTH_SHORT).show()
             }
-            navigate()
         }
     }
 
     fun startCapture() {
-        Log.d("HomeScreen", "startCapture: glassesState=$glassesState")
+        Log.d("ImagePipeline", "startCapture: glassesState=$glassesState")
         if (glassesState == ConnectionState.Connected) {
             capturing = true
             captureFromGlassesThen {
-                capturing = false
                 navController.navigate(ROUTE_LISTENING)
             }
             return
@@ -205,9 +210,10 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
         if (glassesState == ConnectionState.Connected) {
             // Fetch GPS first, then take photo via glasses
             capturing = true
-            fetchLocationThenGlassesCapture(context, viewModel, scope) {
+            fetchLocationThenGlassesCapture(context, viewModel, scope) { ok ->
                 capturing = false
-                navController.navigate(ROUTE_LISTENING)
+                if (ok) navController.navigate(ROUTE_LISTENING)
+                else Toast.makeText(context, "Image capture failed, try again.", Toast.LENGTH_SHORT).show()
             }
             return
         }
@@ -572,7 +578,7 @@ private fun fetchLocationThenGlassesCapture(
     context: Context,
     viewModel: GuideViewModel,
     scope: kotlinx.coroutines.CoroutineScope,
-    onDone: () -> Unit,
+    onResult: (Boolean) -> Unit,
 ) {
     val client = LocationServices.getFusedLocationProviderClient(context)
     val proceed = {
@@ -580,9 +586,13 @@ private fun fetchLocationThenGlassesCapture(
             val bytes = GlassesManager.takePhoto()
             val bitmap = bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
             if (bitmap != null) {
+                Log.d("ImagePipeline", "fetchLocationThenGlassesCapture: bitmap ${bitmap.width}x${bitmap.height}")
                 viewModel.storeBitmap(scaleBitmap(bitmap, 1280))
+                onResult(true)
+            } else {
+                Log.e("ImagePipeline", "fetchLocationThenGlassesCapture: capture failed, bitmap null")
+                onResult(false)
             }
-            onDone()
         }
     }
     client.lastLocation

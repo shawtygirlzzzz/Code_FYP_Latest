@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class FoundDevice(val address: String, val name: String, val rssi: Int)
@@ -27,12 +28,17 @@ data class FoundDevice(val address: String, val name: String, val rssi: Int)
 object GlassesManager {
 
     private const val TAG = "GlassesManager"
+    private const val PTAG = "ImagePipeline"
     private const val SCAN_DURATION_MS = 10_000L
 
     // Photo capture is a 3-protocol flow: BLE control + WiFi Direct + HTTP.
     // The glasses join our WiFi Direct subnet and serve the photo over HTTP.
-    private const val GLASSES_ASSIGNED_IP = "192.168.49.79"
-    private const val WIFI_JOIN_DELAY_MS = 4_000L
+    // GLASSES_STATIC_IP is only a handshake hint passed to writeIpToSoc; the
+    // real IP we connect to comes from the glassesControl p2pIp callback / ARP.
+    private const val GLASSES_STATIC_IP = "192.168.49.79"
+    private const val GROUP_FORMED_TIMEOUT_MS = 10_000L
+    private const val CAPTURE_COMPLETE_TIMEOUT_MS = 10_000L
+    private const val HTTP_SETTLE_DELAY_MS = 1_000L
 
     // HeyCyan glasses advertise with these model-name prefixes
     // (e.g. W610_F83A for the W610; also G300, G3, M01s, QCY models).
@@ -49,7 +55,8 @@ object GlassesManager {
     private val _scanResults = MutableStateFlow<List<FoundDevice>>(emptyList())
     val scanResults: StateFlow<List<FoundDevice>> = _scanResults.asStateFlow()
 
-    private var photoBytesChannel: Channel<ByteArray?>? = null
+    // Signalled when the glasses report capture-complete (notify event 0x02).
+    private var captureCompleteChannel: Channel<Boolean>? = null
     private val _deviceIp = MutableStateFlow<String?>(null)
     private var connectingAddress: String? = null
 
@@ -67,10 +74,8 @@ object GlassesManager {
             Log.d(TAG, "parseData cmdType=$cmdType event=0x${eventType.toString(16)}")
             when (eventType) {
                 0x02 -> {
-                    LargeDataHandler.getInstance().getPictureThumbnails { _, success, data ->
-                        Log.d(TAG, "thumbnail received success=$success size=${data?.size ?: 0}")
-                        photoBytesChannel?.trySend(if (success) data else null)
-                    }
+                    Log.d(PTAG, "capture-complete notification received (event=0x02)")
+                    captureCompleteChannel?.trySend(true)
                 }
                 0x05 -> {
                     if (response.loadData.size > 7) {
@@ -202,67 +207,91 @@ object GlassesManager {
 
     suspend fun takePhoto(): ByteArray? {
         if (!photoInProgress.compareAndSet(false, true)) {
-            Log.d(TAG, "takePhoto: ignored, capture already in progress")
+            Log.d(PTAG, "takePhoto: ignored, capture already in progress")
             return null
         }
         try {
-            Log.d(TAG, "takePhoto: called, connectionState=${_connectionState.value}")
+            Log.d(PTAG, "takePhoto: START connectionState=${_connectionState.value}")
             if (_connectionState.value != ConnectionState.Connected) {
-                Log.e(TAG, "takePhoto called but glasses not connected")
+                Log.e(PTAG, "takePhoto: ABORT — glasses not connected")
                 return null
             }
 
-            // 1. Bring up the WiFi Direct group (phone = group owner) so the
-            //    glasses have a network to join and serve the photo over.
-            Log.d(TAG, "takePhoto: creating WiFi Direct group")
+            // 1. Bring up the WiFi Direct group (phone = group owner).
+            Log.d(PTAG, "takePhoto: creating WiFi Direct group")
             if (!GlassesWifiManager.createGroup()) {
-                Log.e(TAG, "takePhoto: WiFi Direct group creation failed")
+                Log.e(PTAG, "takePhoto: ABORT — WiFi Direct group creation failed")
                 return null
             }
 
             try {
-                _deviceIp.value = null
+                // 2. Wait for the group to actually form (no blind delay).
+                val formed = GlassesWifiManager.awaitGroupFormed(GROUP_FORMED_TIMEOUT_MS)
+                Log.d(PTAG, "takePhoto: groupFormed=$formed goAddress=${GlassesWifiManager.groupOwnerAddress()}")
+                if (!formed) {
+                    Log.e(PTAG, "takePhoto: ABORT — WiFi Direct group not formed within ${GROUP_FORMED_TIMEOUT_MS}ms")
+                    return null
+                }
 
-                // 2. Tell the glasses to take a photo (stored on the glasses).
-                Log.d(TAG, "takePhoto: sending photo command")
+                // 3. Arm the capture-complete waiter BEFORE triggering the photo.
+                _deviceIp.value = null
+                val completeCh = Channel<Boolean>(Channel.CONFLATED)
+                captureCompleteChannel = completeCh
+
+                // 4. Tell the glasses to take a photo; capture the reported p2pIp.
+                Log.d(PTAG, "takePhoto: sending BLE photo command [0x02,0x01,0x01]")
                 LargeDataHandler.getInstance().glassesControl(
                     byteArrayOf(0x02, 0x01, 0x01)
                 ) { _, response ->
-                    Log.d(TAG, "takePhoto: photo cmd resp dataType=${response?.dataType} err=${response?.errorCode} work=${response?.workTypeIng} p2pIp=${response?.p2pIp}")
-                    response?.p2pIp?.let { ip ->
-                        if (ip.count { c -> c == '.' } == 3) _deviceIp.value = ip
+                    val ip = response?.p2pIp
+                    Log.d(PTAG, "takePhoto: glassesControl resp dataType=${response?.dataType} err=${response?.errorCode} work=${response?.workTypeIng} imageCount=${response?.imageCount} p2pIp=$ip")
+                    if (!ip.isNullOrBlank() && ip.count { c -> c == '.' } == 3) {
+                        _deviceIp.value = ip
+                        Log.d(PTAG, "takePhoto: p2pIp captured = $ip")
                     }
                 }
 
-                // 3. Hand the glasses an IP on our WiFi Direct subnet so they
-                //    join the network and start serving media over HTTP.
-                Log.d(TAG, "takePhoto: writeIpToSoc $GLASSES_ASSIGNED_IP")
-                LargeDataHandler.getInstance().writeIpToSoc(GLASSES_ASSIGNED_IP) { _, _ ->
-                    Log.d(TAG, "takePhoto: writeIpToSoc ack")
+                // 5. Handshake: hint the glasses' static IP (SDK requirement).
+                Log.d(PTAG, "takePhoto: writeIpToSoc $GLASSES_STATIC_IP")
+                LargeDataHandler.getInstance().writeIpToSoc(GLASSES_STATIC_IP) { _, _ ->
+                    Log.d(PTAG, "takePhoto: writeIpToSoc ack")
                 }
 
-                // 4. Give the glasses time to join the WiFi Direct group.
-                delay(WIFI_JOIN_DELAY_MS)
-
-                // 5. Locate the glasses' HTTP server on the subnet.
-                val ip = GlassesMediaDownloader.discoverGlassesIp(_deviceIp.value ?: GLASSES_ASSIGNED_IP)
-                if (ip == null) {
-                    Log.e(TAG, "takePhoto: glasses HTTP server not found on WiFi")
+                // 6. Wait for capture-complete (notify event 0x02), 10s timeout.
+                val captured = withTimeoutOrNull(CAPTURE_COMPLETE_TIMEOUT_MS) { completeCh.receive() }
+                if (captured == null) {
+                    Log.e(PTAG, "takePhoto: ABORT — no capture-complete (0x02) within ${CAPTURE_COMPLETE_TIMEOUT_MS}ms")
                     return null
                 }
+                Log.d(PTAG, "takePhoto: capture-complete confirmed; settling ${HTTP_SETTLE_DELAY_MS}ms")
+                delay(HTTP_SETTLE_DELAY_MS)
 
-                // 6. Download the newest image and return its bytes.
+                // 7. Resolve glasses IP: p2pIp -> ARP/DHCP -> probe sweep.
+                val p2pIp = _deviceIp.value
+                val arpIp = GlassesWifiManager.clientIpFromArp()
+                Log.d(PTAG, "takePhoto: IP candidates p2pIp=$p2pIp arpIp=$arpIp")
+                val ip = GlassesMediaDownloader.discoverGlassesIp(listOfNotNull(p2pIp, arpIp))
+                if (ip == null) {
+                    Log.e(PTAG, "takePhoto: ABORT — glasses HTTP server not found on WiFi")
+                    return null
+                }
+                Log.d(PTAG, "takePhoto: glasses HTTP server at $ip")
+
+                // 8. List + download the newest image.
                 val images = GlassesMediaDownloader.fetchImageList(ip)
+                Log.d(PTAG, "takePhoto: media.config images=$images")
                 val newest = images.lastOrNull()
                 if (newest == null) {
-                    Log.e(TAG, "takePhoto: no images listed by glasses")
+                    Log.e(PTAG, "takePhoto: ABORT — no images listed by glasses")
                     return null
                 }
                 val bytes = GlassesMediaDownloader.downloadFile(ip, newest)
-                Log.d(TAG, "takePhoto: finished, result=${if (bytes == null) "null" else "${bytes.size} bytes"}")
+                Log.d(PTAG, "takePhoto: DONE file=$newest downloaded=${bytes?.size ?: 0} bytes")
                 return bytes
             } finally {
+                captureCompleteChannel = null
                 GlassesWifiManager.removeGroup()
+                Log.d(PTAG, "takePhoto: WiFi Direct group removed")
             }
         } finally {
             photoInProgress.set(false)

@@ -13,8 +13,11 @@ import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
+import java.io.File
 
 /**
  * Manages the WiFi Direct (P2P) group used to receive media from the glasses.
@@ -81,6 +84,42 @@ object GlassesWifiManager {
         }
         unregisterReceiver()
         _groupInfo.value = null
+    }
+
+    /** Suspends until the P2P group is formed, or returns false on timeout. */
+    suspend fun awaitGroupFormed(timeoutMs: Long): Boolean {
+        if (_groupInfo.value?.groupFormed == true) return true
+        return withTimeoutOrNull(timeoutMs) {
+            _groupInfo.first { it?.groupFormed == true }
+            true
+        } ?: false
+    }
+
+    fun groupOwnerAddress(): String? = _groupInfo.value?.groupOwnerAddress?.hostAddress
+
+    /**
+     * Best-effort: read the kernel ARP table for a client on the WiFi Direct
+     * subnet (192.168.49.x, excluding the group owner .1). Often empty on
+     * Android 10+, so this is only a fallback to the glassesControl p2pIp.
+     */
+    fun clientIpFromArp(): String? {
+        return try {
+            File("/proc/net/arp").readLines()
+                .drop(1)
+                .mapNotNull { line ->
+                    val c = line.split(Regex("\\s+")).filter { it.isNotBlank() }
+                    if (c.size >= 4) Triple(c[0], c[2], c[3]) else null
+                }
+                .firstOrNull { (ip, flags, mac) ->
+                    ip.startsWith("192.168.49.") && ip != "192.168.49.1" &&
+                        flags != "0x0" && mac != "00:00:00:00:00:00"
+                }
+                ?.first
+                .also { Log.d(TAG, "clientIpFromArp: $it") }
+        } catch (e: Exception) {
+            Log.e(TAG, "clientIpFromArp failed: ${e.message}")
+            null
+        }
     }
 
     private fun registerReceiver() {
