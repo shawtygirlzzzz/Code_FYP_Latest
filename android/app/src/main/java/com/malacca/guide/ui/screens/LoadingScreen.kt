@@ -37,26 +37,28 @@ fun LoadingScreen(navController: NavController, viewModel: GuideViewModel) {
 
     val messages = when {
         isRestaurant -> when (viewModel.selectedLanguage) {
-            "ZH" -> listOf("正在识别餐厅...", "正在获取评分...", "快好了...")
             "MS" -> listOf("Mengenal pasti restoran...", "Mendapatkan penilaian...", "Sebentar lagi...")
             else -> listOf("Identifying restaurant...", "Fetching ratings...", "Almost there...")
         }
         viewModel.isFollowUp -> when (viewModel.selectedLanguage) {
-            "ZH" -> listOf("正在搜索详情...", "查找相关信息...", "快好了...")
             "MS" -> listOf("Mencari maklumat...", "Sedang mencari...", "Sebentar lagi...")
             else -> listOf("Searching for details...", "Looking up information...", "Almost there...")
         }
         else -> when (viewModel.selectedLanguage) {
-            "ZH" -> listOf("正在识别地标...", "正在分析照片...", "正在咨询AI导览...", "正在搜索详情...", "快好了...")
             "MS" -> listOf("Mengenal pasti mercu tanda...", "Menganalisis foto anda...", "Merujuk panduan AI...", "Mencari maklumat...", "Sebentar lagi...")
             else -> listOf("Identifying landmark...", "Analyzing your photo...", "Consulting AI guide...", "Searching for details...", "Almost there...")
         }
     }
 
     val thinkingText = when (viewModel.selectedLanguage) {
-        "ZH" -> "HeyCyan正在思考..."
         "MS" -> "HeyCyan sedang berfikir..."
         else -> "HeyCyan is thinking..."
+    }
+
+    // Shown while the low-resolution BLE thumbnail is being re-shot over WiFi.
+    val retryText = when (viewModel.selectedLanguage) {
+        "MS" -> "Mengambil gambar lebih jelas..."
+        else -> "Taking a sharper photo..."
     }
 
     var messageIndex by remember { mutableIntStateOf(0) }
@@ -103,7 +105,7 @@ fun LoadingScreen(navController: NavController, viewModel: GuideViewModel) {
                 strokeWidth = 5.dp
             )
             Text(
-                text = messages[messageIndex],
+                text = if (viewModel.isRetryingHighRes) retryText else messages[messageIndex],
                 color = TextPrimary,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Medium,

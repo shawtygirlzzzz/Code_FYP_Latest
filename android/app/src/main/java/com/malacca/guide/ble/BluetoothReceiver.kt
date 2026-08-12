@@ -15,8 +15,10 @@ class BluetoothReceiver : BroadcastReceiver() {
             BluetoothDevice.ACTION_ACL_CONNECTED -> {
                 val device: BluetoothDevice? =
                     intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                Log.d(TAG, "device connected ${device?.address}")
-                GlassesManager.markConnected(device?.address)
+                // Link-layer connect only — too early to use the SDK. Real
+                // readiness comes from MyBluetoothReceiver.onServiceDiscovered()
+                // -> GlassesManager.onSdkReady().
+                Log.d(TAG, "device connected ${device?.address} (waiting for SDK onServiceDiscovered)")
             }
             BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
                 val device: BluetoothDevice? =

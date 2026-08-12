@@ -45,6 +45,7 @@ import com.malacca.guide.ui.theme.TextSecondary
 import com.malacca.guide.ui.theme.WarningAmber
 import com.malacca.guide.ui.viewmodel.AppMode
 import com.malacca.guide.ui.viewmodel.GuideViewModel
+import com.malacca.guide.voice.GlassesAudioRouter
 import com.malacca.guide.voice.TtsManager
 
 @Composable
@@ -76,20 +77,22 @@ private fun LandmarkResultScreen(
     val confidence = result?.confidence?.lowercase() ?: "unknown"
 
     LaunchedEffect(responseText) {
+        // Make sure the answer comes out of the glasses, not the phone.
+        GlassesAudioRouter.activate()
         ttsManager.speak(responseText, viewModel.selectedLanguage)
     }
 
     val (badgeColor, badgeLabel) = when (confidence) {
-        "high"   -> SuccessGreen to when (viewModel.selectedLanguage) { "ZH" -> "高"; "MS" -> "Tinggi"; else -> "High" }
-        "medium" -> WarningAmber to when (viewModel.selectedLanguage) { "ZH" -> "中"; "MS" -> "Sederhana"; else -> "Medium" }
-        "low"    -> ErrorRed to when (viewModel.selectedLanguage) { "ZH" -> "低"; "MS" -> "Rendah"; else -> "Low" }
-        else     -> TextSecondary to when (viewModel.selectedLanguage) { "ZH" -> "不明"; "MS" -> "Tidak diketahui"; else -> "Unknown" }
+        "high"   -> SuccessGreen to when (viewModel.selectedLanguage) { "MS" -> "Tinggi"; else -> "High" }
+        "medium" -> WarningAmber to when (viewModel.selectedLanguage) { "MS" -> "Sederhana"; else -> "Medium" }
+        "low"    -> ErrorRed to when (viewModel.selectedLanguage) { "MS" -> "Rendah"; else -> "Low" }
+        else     -> TextSecondary to when (viewModel.selectedLanguage) { "MS" -> "Tidak diketahui"; else -> "Unknown" }
     }
 
-    val backText    = when (viewModel.selectedLanguage) { "ZH" -> "← 返回"; "MS" -> "← Kembali"; else -> "← Back" }
-    val replayText  = when (viewModel.selectedLanguage) { "ZH" -> "重播"; "MS" -> "Main semula"; else -> "Replay" }
-    val followText  = when (viewModel.selectedLanguage) { "ZH" -> "继续提问"; "MS" -> "Tanya lanjut"; else -> "Ask follow-up" }
-    val anotherText = when (viewModel.selectedLanguage) { "ZH" -> "询问其他地标"; "MS" -> "Tanya mercu tanda lain"; else -> "Ask another landmark" }
+    val backText    = when (viewModel.selectedLanguage) { "MS" -> "← Kembali"; else -> "← Back" }
+    val replayText  = when (viewModel.selectedLanguage) { "MS" -> "Main semula"; else -> "Replay" }
+    val followText  = when (viewModel.selectedLanguage) { "MS" -> "Tanya lanjut"; else -> "Ask follow-up" }
+    val anotherText = when (viewModel.selectedLanguage) { "MS" -> "Tanya mercu tanda lain"; else -> "Ask another landmark" }
 
     Scaffold(
         containerColor = BackgroundDark,
@@ -170,18 +173,22 @@ private fun RestaurantResultScreen(
     val responseText = nearby?.response ?: restaurant?.response ?: restaurant?.message ?: "No response received."
 
     LaunchedEffect(responseText) {
+        GlassesAudioRouter.activate()
         ttsManager.speak(responseText, viewModel.selectedLanguage)
     }
 
     // Speak nearby response automatically when it arrives
     LaunchedEffect(nearby) {
-        nearby?.response?.let { ttsManager.speak(it, viewModel.selectedLanguage) }
+        nearby?.response?.let {
+            GlassesAudioRouter.activate()
+            ttsManager.speak(it, viewModel.selectedLanguage)
+        }
     }
 
-    val backText   = when (viewModel.selectedLanguage) { "ZH" -> "← 返回"; "MS" -> "← Kembali"; else -> "← Back" }
-    val replayText = when (viewModel.selectedLanguage) { "ZH" -> "重播"; "MS" -> "Main semula"; else -> "Replay" }
-    val nearbyText = when (viewModel.selectedLanguage) { "ZH" -> "附近餐厅"; "MS" -> "Restoran Berdekatan"; else -> "Find Nearby" }
-    val anotherText = when (viewModel.selectedLanguage) { "ZH" -> "扫描其他餐厅"; "MS" -> "Imbas restoran lain"; else -> "Scan another restaurant" }
+    val backText   = when (viewModel.selectedLanguage) { "MS" -> "← Kembali"; else -> "← Back" }
+    val replayText = when (viewModel.selectedLanguage) { "MS" -> "Main semula"; else -> "Replay" }
+    val nearbyText = when (viewModel.selectedLanguage) { "MS" -> "Restoran Berdekatan"; else -> "Find Nearby" }
+    val anotherText = when (viewModel.selectedLanguage) { "MS" -> "Imbas restoran lain"; else -> "Scan another restaurant" }
 
     Scaffold(
         containerColor = BackgroundDark,
@@ -237,7 +244,7 @@ private fun RestaurantResultScreen(
             // Nearby results list
             if (nearby != null) {
                 val nearbyTitle = when (viewModel.selectedLanguage) {
-                    "MS" -> "Pilihan Berdekatan"; "ZH" -> "附近的选择"; else -> "Nearby Alternatives"
+                    "MS" -> "Pilihan Berdekatan"; else -> "Nearby Alternatives"
                 }
                 Text(text = nearbyTitle, color = TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 nearby.alternatives.forEach { place ->
@@ -319,10 +326,6 @@ private fun priceLevelLabel(level: Int?, language: String = "EN") = when (langua
         1 -> "Berpatutan"; 2 -> "Harga sederhana"; 3 -> "Mahal"; 4 -> "Sangat mahal"
         else -> "Harga tidak dinyatakan"
     }
-    "ZH" -> when (level) {
-        1 -> "经济实惠"; 2 -> "中等价格"; 3 -> "偏贵"; 4 -> "非常昂贵"
-        else -> "未列出价格"
-    }
     else -> when (level) {
         1 -> "Affordable"; 2 -> "Moderately priced"; 3 -> "Pricey"; 4 -> "Very expensive"
         else -> "Price not listed"
@@ -331,7 +334,6 @@ private fun priceLevelLabel(level: Int?, language: String = "EN") = when (langua
 
 private fun reviewsLabel(count: Int?, language: String) = when (language) {
     "MS" -> "${count ?: 0} ulasan"
-    "ZH" -> "${count ?: 0} 条评论"
     else -> "${count ?: 0} reviews"
 }
 
@@ -339,13 +341,11 @@ private fun isOpenNow(hours: String?, language: String): Boolean {
     val h = hours ?: return false
     return when (language) {
         "MS" -> h.contains("dibuka", ignoreCase = true)
-        "ZH" -> h.contains("营业")
         else -> h.contains("Open", ignoreCase = true)
     }
 }
 
 private fun awayLabel(distanceM: Int, language: String) = when (language) {
     "MS" -> "${distanceM}m dari sini"
-    "ZH" -> "${distanceM}米"
     else -> "${distanceM}m away"
 }

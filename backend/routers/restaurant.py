@@ -13,8 +13,6 @@ _PRICE_LABELS = {
            3: "Pricey", 4: "Very expensive"},
     "ms": {0: "Harga tidak dinyatakan", 1: "Berpatutan", 2: "Harga sederhana",
            3: "Mahal", 4: "Sangat mahal"},
-    "zh": {0: "未列出价格", 1: "经济实惠", 2: "中等价格",
-           3: "偏贵", 4: "非常昂贵"},
 }
 
 
@@ -30,11 +28,6 @@ def _spoken_main(d: dict, price_str: str, language: str) -> str:
             f"dengan {d['review_count']} ulasan. Ia menyajikan makanan {d['cuisine']}. "
             f"{price_str}. {d['opening_hours']}."
         )
-    if language == "zh":
-        return (
-            f"这是{d['restaurant_name']}，5星中获得{d['rating']}星评分，共{d['review_count']}条评论。"
-            f"供应{d['cuisine']}菜。{price_str}。{d['opening_hours']}。"
-        )
     return (
         f"This is {d['restaurant_name']}, rated {d['rating']} out of 5 stars "
         f"with {d['review_count']} reviews. It serves {d['cuisine']} food. "
@@ -43,21 +36,17 @@ def _spoken_main(d: dict, price_str: str, language: str) -> str:
 
 
 def _review_prefix(language: str) -> str:
-    return {"ms": "Seorang pengulas berkata: ", "zh": "一位评论者说："}.get(language, "One reviewer said: ")
+    return {"ms": "Seorang pengulas berkata: "}.get(language, "One reviewer said: ")
 
 
 def _nearby_intro(language: str) -> str:
-    return {"ms": "Berikut adalah beberapa restoran berdekatan. ",
-            "zh": "以下是附近的一些餐厅。"}.get(language, "Here are some nearby alternatives. ")
+    return {"ms": "Berikut adalah beberapa restoran berdekatan. "}.get(language, "Here are some nearby alternatives. ")
 
 
 def _nearby_item(a, price_str: str, language: str) -> str:
     if language == "ms":
         return (f"{a.name}, dinilai {a.rating} bintang, {a.distance_m} meter dari sini, "
                 f"menyajikan makanan {a.cuisine}. {price_str}. {a.opening_hours}.")
-    if language == "zh":
-        return (f"{a.name}，评分{a.rating}星，距离{a.distance_m}米，供应{a.cuisine}菜。"
-                f"{price_str}。{a.opening_hours}。")
     return (f"{a.name}, rated {a.rating} stars, {a.distance_m} metres away, "
             f"serving {a.cuisine} food. {price_str}. {a.opening_hours}.")
 

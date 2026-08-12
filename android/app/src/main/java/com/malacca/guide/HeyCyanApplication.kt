@@ -10,6 +10,7 @@ import com.malacca.guide.ble.BluetoothReceiver
 import com.malacca.guide.ble.GlassesManager
 import com.malacca.guide.ble.GlassesWifiManager
 import com.malacca.guide.ble.MyBluetoothReceiver
+import com.malacca.guide.voice.GlassesAudioRouter
 import com.oudmon.ble.base.bluetooth.BleAction
 import com.oudmon.ble.base.bluetooth.BleBaseControl
 import com.oudmon.ble.base.bluetooth.BleOperateManager
@@ -22,6 +23,7 @@ class HeyCyanApplication : Application() {
         initBle()
         GlassesManager.init(this)
         GlassesWifiManager.init(this)
+        GlassesAudioRouter.init(this)
     }
 
     private fun initBle() {

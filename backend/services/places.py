@@ -33,20 +33,11 @@ _CUISINE_MAP = {
         "bakery": "Bakeri", "fast_food_restaurant": "Makanan Segera",
         "_default": "Makanan Tempatan",
     },
-    "zh": {
-        "chinese_restaurant": "中餐", "indian_restaurant": "印度菜",
-        "japanese_restaurant": "日本料理", "korean_restaurant": "韩国料理",
-        "thai_restaurant": "泰国菜", "seafood_restaurant": "海鲜",
-        "malay_restaurant": "马来菜", "cafe": "咖啡馆",
-        "bakery": "烘焙坊", "fast_food_restaurant": "快餐",
-        "_default": "本地美食",
-    },
 }
 
 _OPEN_LABELS = {
     "en": {"open": "Open now", "closed": "Closed now", "unknown": "Hours not available"},
     "ms": {"open": "Sedang dibuka", "closed": "Tutup sekarang", "unknown": "Waktu tidak tersedia"},
-    "zh": {"open": "营业中", "closed": "已打烊", "unknown": "时间不详"},
 }
 
 

@@ -32,7 +32,6 @@ Rules:
 
 LANGUAGE_NAMES = {
     "en": "English",
-    "zh": "Mandarin Chinese",
     "ms": "Bahasa Melayu",
 }
 
@@ -42,8 +41,6 @@ LOW_CONFIDENCE_PHRASES = [
     "unclear", "try a closer", "unable to identify",
     # Bahasa Melayu
     "tidak dapat mengenal pasti", "tidak pasti", "tidak jelas", "cuba lebih dekat",
-    # Chinese
-    "无法识别", "不确定", "不清楚", "无法辨认",
 ]
 
 
@@ -54,15 +51,34 @@ def get_gemini_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def analyze_landmark(image_bytes: bytes, query: str, language: str = "en", landmark_context: str = "") -> dict:
+def analyze_landmark(
+    image_bytes: bytes,
+    query: str,
+    language: str = "en",
+    landmark_context: str = "",
+    audio_bytes: bytes | None = None,
+    audio_mime: str = "audio/wav",
+) -> dict:
     """
-    Send image + query to Gemini 2.5 Flash.
+    Send image + question to Gemini 2.5 Flash.
+
+    The question arrives either as text or, when the app recorded it from the
+    glasses microphone, as audio. Gemini reads the audio directly, which avoids
+    a separate speech-to-text step — on-device recognition proved unreliable over
+    the glasses' narrowband Bluetooth link.
+
     Returns dict with landmark_name, response, confidence.
     """
     client = get_gemini_client()
 
     lang_name = LANGUAGE_NAMES.get(language, "English")
     base_query = query if query else "What is this landmark? Tell me about it."
+    if audio_bytes:
+        base_query = (
+            "The tourist's question is in the attached audio clip. Listen to it and "
+            "answer it directly. If the audio is unclear or contains no question, "
+            "simply describe the landmark in the image."
+        )
 
     if landmark_context:
         user_prompt = (
@@ -89,10 +105,7 @@ def analyze_landmark(image_bytes: bytes, query: str, language: str = "en", landm
             temperature=0.4,
             tools=[build_search_tool()],
         ),
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            types.Part.from_text(text=user_prompt),
-        ],
+        contents=_build_contents(image_bytes, user_prompt, audio_bytes, audio_mime),
     )
 
     response_text = response.text.strip().replace("**", "")
@@ -105,6 +118,19 @@ def analyze_landmark(image_bytes: bytes, query: str, language: str = "en", landm
         "response": response_text,
         "confidence": confidence,
     }
+
+
+def _build_contents(
+    image_bytes: bytes,
+    user_prompt: str,
+    audio_bytes: bytes | None,
+    audio_mime: str,
+) -> list:
+    parts = [types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")]
+    if audio_bytes:
+        parts.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime))
+    parts.append(types.Part.from_text(text=user_prompt))
+    return parts
 
 
 def _assess_confidence(response_text: str) -> str:

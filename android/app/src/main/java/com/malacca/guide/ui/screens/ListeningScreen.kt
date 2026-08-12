@@ -1,12 +1,9 @@
 package com.malacca.guide.ui.screens
 
 import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import android.util.Log
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -26,10 +23,11 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -48,77 +46,113 @@ import com.malacca.guide.ui.theme.MalaccaTeal
 import com.malacca.guide.ui.theme.TextPrimary
 import com.malacca.guide.ui.theme.TextSecondary
 import com.malacca.guide.ui.viewmodel.GuideViewModel
+import com.malacca.guide.voice.GlassesAudioRouter
+import com.malacca.guide.voice.VoiceRecorder
+import kotlinx.coroutines.delay
 
+private const val STT_TAG = "SttPipeline"
+
+/** Settling time for the Bluetooth SCO link before recording starts. */
+private const val SCO_WARMUP_MS = 600L
+
+/**
+ * Records the tourist's spoken question.
+ *
+ * The audio is sent to the backend rather than transcribed on the device.
+ * Android's SpeechRecognizer proved unreliable over the glasses' Bluetooth link:
+ * it repeatedly returned NO_MATCH with no partial results even given 2+ seconds
+ * of speech, and it chose the phone's built-in microphone regardless of the
+ * routing we requested. Recording here means the microphone and the stop
+ * condition are both ours, and Gemini does the transcription.
+ */
 @Composable
 fun ListeningScreen(navController: NavController, viewModel: GuideViewModel) {
     val context = LocalContext.current
-    val localeTag = when (viewModel.selectedLanguage) {
-        "ZH" -> "zh-CN"
-        "MS" -> "ms-MY"
-        else -> "en-US"
-    }
+    var statusText by remember { mutableStateOf<String?>(null) }
+
     val listeningText = when (viewModel.selectedLanguage) {
-        "ZH" -> "正在聆听..."
         "MS" -> "Mendengar..."
         else -> "Listening..."
     }
     val speakNowText = when (viewModel.selectedLanguage) {
-        "ZH" -> "请说话..."
         "MS" -> "Sila bercakap..."
         else -> "Speak now..."
     }
     val stopText = when (viewModel.selectedLanguage) {
-        "ZH" -> "停止"
         "MS" -> "BERHENTI"
         else -> "STOP"
     }
-
-    val recognizer = remember { SpeechRecognizer.createSpeechRecognizer(context) }
-    val sttIntent = remember(localeTag) {
-        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-        }
+    val connectingText = when (viewModel.selectedLanguage) {
+        "MS" -> "Menyambung mikrofon..."
+        else -> "Connecting microphone..."
     }
+
+    var permissionGranted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    var permissionRequested by remember { mutableStateOf(false) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) recognizer.startListening(sttIntent)
-        else navController.popBackStack(ROUTE_HOME, inclusive = false)
-    }
-
-    DisposableEffect(Unit) {
-        recognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onResults(bundle: Bundle) {
-                val text = bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull() ?: ""
-                viewModel.updateTranscript(text)
-                navController.navigate(ROUTE_LOADING)
-            }
-            override fun onError(error: Int) {
-                navController.popBackStack(ROUTE_HOME, inclusive = false)
-            }
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onPartialResults(partialResults: Bundle?) {}
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-        onDispose { recognizer.destroy() }
+        permissionGranted = granted
+        if (!granted) {
+            Toast.makeText(context, "Microphone permission needed.", Toast.LENGTH_SHORT).show()
+            navController.popBackStack(ROUTE_HOME, inclusive = false)
+        }
     }
 
     LaunchedEffect(Unit) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            recognizer.startListening(sttIntent)
-        } else {
+        if (!permissionGranted && !permissionRequested) {
+            permissionRequested = true
             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
+    }
+
+    LaunchedEffect(permissionGranted) {
+        if (!permissionGranted) return@LaunchedEffect
+
+        statusText = connectingText
+        val onGlasses = GlassesAudioRouter.activate()
+        Log.d(STT_TAG, "mic routed to glasses=$onGlasses")
+        if (onGlasses) {
+            // The SCO link reports itself routed before it carries clean audio.
+            delay(SCO_WARMUP_MS)
+        }
+        statusText = null
+
+        val device = if (onGlasses) GlassesAudioRouter.glassesInputDevice() else null
+        val result = VoiceRecorder.record(context, device)
+
+        if (result == null) {
+            Log.e(STT_TAG, "recording failed")
+            Toast.makeText(context, "Couldn't record your question.", Toast.LENGTH_SHORT).show()
+            navController.popBackStack(ROUTE_HOME, inclusive = false)
+            return@LaunchedEffect
+        }
+
+        Log.d(
+            STT_TAG,
+            "recorded ${result.wav.size} bytes, ${result.durationMs}ms, " +
+                "peak=${result.peakAmplitude}, heardSpeech=${result.heardSpeech}"
+        )
+
+        // Silence still goes forward: the photo is already taken, and the backend
+        // falls back to describing whatever the tourist is looking at.
+        if (!result.heardSpeech) {
+            Toast.makeText(
+                context,
+                "Didn't hear a question — describing what you're looking at.",
+                Toast.LENGTH_SHORT
+            ).show()
+            viewModel.updateQuestionAudio(null)
+        } else {
+            viewModel.updateQuestionAudio(result.wav)
+        }
+        navController.navigate(ROUTE_LOADING)
     }
 
     val infiniteTransition = rememberInfiniteTransition(label = "waveform")
@@ -152,7 +186,7 @@ fun ListeningScreen(navController: NavController, viewModel: GuideViewModel) {
             verticalArrangement = Arrangement.spacedBy(32.dp)
         ) {
             Text(
-                text = listeningText,
+                text = statusText ?: listeningText,
                 color = TextPrimary,
                 fontSize = 28.sp,
                 fontWeight = FontWeight.Bold

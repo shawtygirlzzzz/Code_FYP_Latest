@@ -70,6 +70,7 @@ import com.malacca.guide.ui.theme.TextSecondary
 import com.malacca.guide.ui.theme.WarningAmber
 import com.malacca.guide.ui.viewmodel.AppMode
 import com.malacca.guide.ui.viewmodel.GuideViewModel
+import com.malacca.guide.voice.GlassesAudioRouter
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -80,13 +81,22 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
     val scope = rememberCoroutineScope()
     val selectedLanguage = viewModel.selectedLanguage
     val appMode = viewModel.appMode
-    val languages = listOf("EN", "ZH", "MS")
+    val languages = listOf("EN", "MS")
 
     val glassesState by GlassesManager.connectionState.collectAsState()
     val scanResults by GlassesManager.scanResults.collectAsState()
+    val audioAvailable by GlassesAudioRouter.headsetAvailable.collectAsState()
     var showScanSheet by remember { mutableStateOf(false) }
     var capturing by remember { mutableStateOf(false) }
     val scanSheetState = rememberModalBottomSheetState()
+
+    // Home is the resting screen, so it owns releasing the glasses audio route.
+    // Holding SCO open outside an interaction would hijack phone audio and
+    // drain the battery.
+    LaunchedEffect(Unit) {
+        GlassesAudioRouter.deactivate()
+        GlassesAudioRouter.refreshAvailability()
+    }
 
     val btPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -122,30 +132,25 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
 
     val titleText = when {
         appMode == AppMode.RESTAURANT -> when (selectedLanguage) {
-            "ZH" -> "拍摄餐厅招牌\n获取资讯"
             "MS" -> "Ambil gambar papan\ntanda restoran"
             else -> "Point at a restaurant\nsign to identify it"
         }
         else -> when (selectedLanguage) {
-            "ZH" -> "你想了解\n什么景点？"
             "MS" -> "Apa yang anda\ningin tahu?"
             else -> "What would you like\nto know about?"
         }
     }
     val subtitleText = when {
         appMode == AppMode.RESTAURANT -> when (selectedLanguage) {
-            "ZH" -> "点击拍摄餐厅招牌\n获取评分和资讯"
             "MS" -> "Ketuk untuk ambil gambar\npapan tanda restoran"
             else -> "Tap to capture the\nrestaurant signage"
         }
         else -> when (selectedLanguage) {
-            "ZH" -> "点击并询问HeyCyan\n您所看到的景点"
             "MS" -> "Ketuk dan tanya HeyCyan\ntentang apa yang anda lihat"
             else -> "Tap and ask HeyCyan\nabout what you see"
         }
     }
     val galleryText = when (selectedLanguage) {
-        "ZH" -> "从相册选择图片"
         "MS" -> "Pilih dari galeri"
         else -> "Pick from gallery"
     }
@@ -410,12 +415,35 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
                 color = SurfaceDark,
                 shape = RoundedCornerShape(8.dp)
             ) {
-                Text(
-                    text = glassesText,
-                    color = glassesColor,
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(12.dp)
-                )
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(text = glassesText, color = glassesColor, fontSize = 13.sp)
+                    if (glassesState == ConnectionState.Connected) {
+                        val audioText = if (audioAvailable) {
+                            when (selectedLanguage) {
+                                "MS" -> "Mikrofon & pembesar suara cermin mata sedia"
+                                else -> "Glasses mic & speaker ready"
+                            }
+                        } else {
+                            when (selectedLanguage) {
+                                "MS" -> "Audio pada telefon — gandingkan cermin mata sebagai peranti audio Bluetooth"
+                                else -> "Audio on phone — pair the glasses as a Bluetooth audio device"
+                            }
+                        }
+                        Text(
+                            text = audioText,
+                            color = if (audioAvailable) SuccessGreen else WarningAmber,
+                            fontSize = 11.sp
+                        )
+                        Text(
+                            text = when (selectedLanguage) {
+                                "MS" -> "Atau tekan butang pada cermin mata untuk mula"
+                                else -> "Or press the button on your glasses to start"
+                            },
+                            color = TextSecondary,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
             }
         }
     }
@@ -606,7 +634,7 @@ private fun fetchLocationThenGlassesCapture(
         }
 }
 
-private fun scaleBitmap(bitmap: Bitmap, maxDim: Int): Bitmap {
+internal fun scaleBitmap(bitmap: Bitmap, maxDim: Int): Bitmap {
     if (bitmap.width <= maxDim && bitmap.height <= maxDim) return bitmap
     val scale = maxDim.toFloat() / maxOf(bitmap.width, bitmap.height)
     return Bitmap.createScaledBitmap(

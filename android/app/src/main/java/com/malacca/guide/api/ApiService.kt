@@ -19,13 +19,18 @@ interface ApiService {
     @GET("health")
     suspend fun health(): Response<HealthResponse>
 
+    /**
+     * @param audio optional WAV of the spoken question. When present the backend
+     *   uses it instead of [query]; Gemini reads the audio directly.
+     */
     @Multipart
     @POST("analyze")
     suspend fun analyze(
         @Part image: MultipartBody.Part,
         @Part("query") query: RequestBody,
         @Part("language") language: RequestBody,
-        @Part("landmark_context") landmarkContext: RequestBody
+        @Part("landmark_context") landmarkContext: RequestBody,
+        @Part audio: MultipartBody.Part? = null
     ): Response<AnalyzeResponse>
 
     @Multipart

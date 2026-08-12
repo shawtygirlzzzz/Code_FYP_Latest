@@ -1,6 +1,7 @@
 package com.malacca.guide.ui.viewmodel
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -12,6 +13,8 @@ import com.malacca.guide.api.models.AnalyzeResponse
 import com.malacca.guide.api.models.NearbyRequest
 import com.malacca.guide.api.models.NearbyResponse
 import com.malacca.guide.api.models.RestaurantResponse
+import com.malacca.guide.ble.ConnectionState
+import com.malacca.guide.ble.GlassesManager
 import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -30,6 +33,13 @@ class GuideViewModel : ViewModel() {
         private set
     var transcript by mutableStateOf("")
         private set
+
+    /**
+     * The recorded question as WAV, sent to the backend for Gemini to interpret.
+     * Null when nothing was heard, in which case the backend describes the scene.
+     */
+    var questionAudio by mutableStateOf<ByteArray?>(null)
+        private set
     var capturedBitmap by mutableStateOf<Bitmap?>(null)
         private set
     var isAnalyzing by mutableStateOf(false)
@@ -43,6 +53,11 @@ class GuideViewModel : ViewModel() {
     private var landmarkContext = ""
     var isFollowUp by mutableStateOf(false)
         private set
+
+    /** True while a low-confidence result is being retried at full resolution. */
+    var isRetryingHighRes by mutableStateOf(false)
+        private set
+    private var triedFullRes = false
 
     // Restaurant state
     var restaurantResult by mutableStateOf<RestaurantResponse?>(null)
@@ -63,6 +78,7 @@ class GuideViewModel : ViewModel() {
     fun setLanguage(lang: String) { selectedLanguage = lang }
     fun setMode(mode: AppMode) { appMode = mode }
     fun updateTranscript(text: String) { transcript = text }
+    fun updateQuestionAudio(wav: ByteArray?) { questionAudio = wav }
     fun storeBitmap(bitmap: Bitmap) { capturedBitmap = bitmap }
     fun updateLocation(lat: Double, lng: Double) {
         currentLat = lat
@@ -78,8 +94,11 @@ class GuideViewModel : ViewModel() {
         nearbyError = null
         capturedBitmap = null
         transcript = ""
+        questionAudio = null
         landmarkContext = ""
         isFollowUp = false
+        isRetryingHighRes = false
+        triedFullRes = false
     }
 
     fun clearResultForFollowUp() {
@@ -88,17 +107,18 @@ class GuideViewModel : ViewModel() {
         analyzeResult = null
         analyzeError = null
         transcript = ""
+        questionAudio = null
     }
 
-    private fun compressBitmap(): ByteArray? {
-        val bitmap = capturedBitmap ?: return null
+    private fun compressBitmap(): ByteArray? = capturedBitmap?.let { compress(it) }
+
+    private fun compress(bitmap: Bitmap): ByteArray {
         val stream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)
         return stream.toByteArray()
     }
 
     private fun langCode() = when (selectedLanguage) {
-        "ZH" -> "zh"
         "MS" -> "ms"
         else -> "en"
     }
@@ -115,25 +135,38 @@ class GuideViewModel : ViewModel() {
             analyzeResult = null
             analyzeError = null
             try {
-                val imagePart = MultipartBody.Part.createFormData(
-                    "image", "photo.jpg",
-                    bytes.toRequestBody("image/jpeg".toMediaType())
-                )
-                val query = transcript.ifBlank { "What is this building? Tell me about it." }
-                val response = ApiClient.apiService.analyze(
-                    imagePart,
-                    query.toRequestBody("text/plain".toMediaType()),
-                    langCode().toRequestBody("text/plain".toMediaType()),
-                    landmarkContext.toRequestBody("text/plain".toMediaType())
-                )
-                Log.d(TAG, "analyze: response code=${response.code()}, successful=${response.isSuccessful}")
-                if (response.isSuccessful) {
-                    analyzeResult = response.body()
-                    Log.d(TAG, "analyze: result status=${analyzeResult?.status}, response=${analyzeResult?.response?.take(80)}")
-                } else {
-                    val err = "Server error ${response.code()}"
-                    Log.e(TAG, "analyze: $err — body=${response.errorBody()?.string()}")
-                    analyzeError = err
+                var result = callAnalyze(bytes)
+
+                // The BLE thumbnail is low resolution, which is usually the
+                // reason Gemini can't place a landmark. Before giving the
+                // tourist a shrug, retake the shot at full resolution over
+                // WiFi Direct and ask once more.
+                if (shouldRetryAtFullResolution(result)) {
+                    Log.d(TAG, "analyze: confidence=${result?.confidence} — retrying at full resolution")
+                    triedFullRes = true
+                    isRetryingHighRes = true
+                    try {
+                        val hiRes = GlassesManager.captureFullResolution()
+                        val bitmap = hiRes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+                        if (bitmap != null) {
+                            Log.d(TAG, "analyze: full-res capture ${bitmap.width}x${bitmap.height}")
+                            capturedBitmap = bitmap
+                            val retry = callAnalyze(compress(bitmap))
+                            if (retry != null) {
+                                result = retry
+                                analyzeError = null
+                            }
+                        } else {
+                            Log.w(TAG, "analyze: full-res capture failed, keeping thumbnail result")
+                        }
+                    } finally {
+                        isRetryingHighRes = false
+                    }
+                }
+
+                if (result != null) {
+                    analyzeResult = result
+                    Log.d(TAG, "analyze: result status=${result.status}, confidence=${result.confidence}, response=${result.response?.take(80)}")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "analyze: exception ${e::class.simpleName}: ${e.message}", e)
@@ -142,6 +175,46 @@ class GuideViewModel : ViewModel() {
                 isAnalyzing = false
             }
         }
+    }
+
+    /** Returns the parsed body, or null after recording the failure. */
+    private suspend fun callAnalyze(bytes: ByteArray): AnalyzeResponse? {
+        val imagePart = MultipartBody.Part.createFormData(
+            "image", "photo.jpg",
+            bytes.toRequestBody("image/jpeg".toMediaType())
+        )
+        // The spoken question goes up as audio when we have it; the text query is
+        // only a fallback for when nothing was recorded.
+        val audioPart = questionAudio?.let { wav ->
+            MultipartBody.Part.createFormData(
+                "audio", "question.wav",
+                wav.toRequestBody("audio/wav".toMediaType())
+            )
+        }
+        val query = transcript.ifBlank { "What is this building? Tell me about it." }
+        Log.d(TAG, "callAnalyze: image=${bytes.size}B audio=${questionAudio?.size ?: 0}B query='$query'")
+        val response = ApiClient.apiService.analyze(
+            imagePart,
+            query.toRequestBody("text/plain".toMediaType()),
+            langCode().toRequestBody("text/plain".toMediaType()),
+            landmarkContext.toRequestBody("text/plain".toMediaType()),
+            audioPart
+        )
+        Log.d(TAG, "callAnalyze: code=${response.code()}, successful=${response.isSuccessful}")
+        if (response.isSuccessful) return response.body()
+        val err = "Server error ${response.code()}"
+        Log.e(TAG, "callAnalyze: $err — body=${response.errorBody()?.string()}")
+        analyzeError = err
+        return null
+    }
+
+    private fun shouldRetryAtFullResolution(result: AnalyzeResponse?): Boolean {
+        if (triedFullRes) return false
+        // Follow-ups reuse the known landmark, so a sharper photo buys nothing.
+        if (landmarkContext.isNotBlank()) return false
+        if (GlassesManager.connectionState.value != ConnectionState.Connected) return false
+        val confidence = result?.confidence?.lowercase()
+        return result == null || result.status == "error" || confidence == "low" || confidence == "unknown"
     }
 
     fun analyzeRestaurant() {
