@@ -20,20 +20,31 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.style.TextAlign
 import androidx.navigation.NavController
 import com.malacca.guide.api.models.PlaceAlternative
+import com.malacca.guide.ble.ConnectionState
+import com.malacca.guide.ble.GlassesManager
 import com.malacca.guide.ui.navigation.ROUTE_HOME
 import com.malacca.guide.ui.navigation.ROUTE_LISTENING
+import com.malacca.guide.ui.navigation.ROUTE_LOADING
 import com.malacca.guide.ui.theme.BackgroundDark
 import com.malacca.guide.ui.theme.ErrorRed
 import com.malacca.guide.ui.theme.MalaccaGold
@@ -45,8 +56,26 @@ import com.malacca.guide.ui.theme.TextSecondary
 import com.malacca.guide.ui.theme.WarningAmber
 import com.malacca.guide.ui.viewmodel.AppMode
 import com.malacca.guide.ui.viewmodel.GuideViewModel
+import com.malacca.guide.voice.Earcon
 import com.malacca.guide.voice.GlassesAudioRouter
 import com.malacca.guide.voice.TtsManager
+import com.malacca.guide.voice.VoiceRecorder
+import kotlinx.coroutines.delay
+
+private const val FOLLOW_UP_TAG = "FollowUp"
+
+/**
+ * How long to wait for a follow-up question before giving up.
+ *
+ * Four seconds proved too tight: a recording showed the wearer beginning to speak
+ * 2.8s after the cue tone, leaving barely a second of the question before the
+ * window closed. Reacting to a beep, drawing breath and starting a sentence takes
+ * longer than it seems.
+ */
+private const val FOLLOW_UP_LISTEN_MS = 7_000L
+
+/** Let the cue tone finish before opening the microphone, so it isn't recorded. */
+private const val BEEP_SETTLE_MS = 520L
 
 @Composable
 fun ResultScreen(navController: NavController, viewModel: GuideViewModel, ttsManager: TtsManager) {
@@ -70,16 +99,71 @@ private fun LandmarkResultScreen(
     viewModel: GuideViewModel,
     ttsManager: TtsManager
 ) {
+    val context = LocalContext.current
+    val glassesState by GlassesManager.connectionState.collectAsState()
+    val handsFree = glassesState == ConnectionState.Connected
     val result = viewModel.analyzeResult
     val bitmap = viewModel.capturedBitmap
     val landmarkName = result?.landmarkName ?: "Unknown Landmark"
     val responseText = result?.response ?: result?.message ?: "No response received."
     val confidence = result?.confidence?.lowercase() ?: "unknown"
 
+    // Hands-free follow-up: once the answer has been spoken, listen briefly so
+    // the tourist can just carry on talking ("how much is the ticket?") instead
+    // of reaching for the phone. The glasses button stays reserved for starting
+    // a new landmark, so the two actions never compete.
+    var speechFinished by remember { mutableStateOf(false) }
+    var awaitingFollowUp by remember { mutableStateOf(false) }
+
     LaunchedEffect(responseText) {
         // Make sure the answer comes out of the glasses, not the phone.
         GlassesAudioRouter.activate()
-        ttsManager.speak(responseText, viewModel.selectedLanguage)
+        speechFinished = false
+        ttsManager.speak(responseText, viewModel.selectedLanguage) { speechFinished = true }
+    }
+
+    LaunchedEffect(speechFinished) {
+        if (!speechFinished) return@LaunchedEffect
+        // Nothing to follow up on unless an answer actually came back. A backend
+        // or AI failure still returns a result object carrying an error message,
+        // and inviting a follow-up about a failure is worse than staying quiet.
+        if (result == null || result.status != "success" || result.response.isNullOrBlank()) {
+            Log.d(FOLLOW_UP_TAG, "no follow-up offered: status=${result?.status}")
+            return@LaunchedEffect
+        }
+
+        // Re-establish the route before anything else. The system tears the SCO
+        // link down when playback ends, so by the time a long answer has finished
+        // speaking the route is usually gone — leaving the cue tone inaudible and
+        // the recording completely silent (peak=0). activate() verifies the route
+        // is genuinely live rather than trusting the cached flag.
+        val onGlasses = GlassesAudioRouter.activate()
+
+        // Recording can only start once the speaker is idle, otherwise the app
+        // records its own voice and answers itself. The beep needs the same
+        // treatment: the glasses microphone sits inches from their speaker, so
+        // recording through the tone captures it as if it were speech.
+        Earcon.playListening()
+        delay(BEEP_SETTLE_MS)
+        awaitingFollowUp = true
+        val device = if (onGlasses) GlassesAudioRouter.glassesInputDevice() else null
+        val recording = VoiceRecorder.record(
+            context = context,
+            preferredDevice = device,
+            noSpeechTimeoutMs = FOLLOW_UP_LISTEN_MS
+        )
+        awaitingFollowUp = false
+
+        if (recording == null || !recording.heardSpeech) {
+            Log.d(FOLLOW_UP_TAG, "no follow-up asked, staying on the result")
+            return@LaunchedEffect
+        }
+        Log.d(FOLLOW_UP_TAG, "follow-up captured: ${recording.durationMs}ms")
+
+        // clearResultForFollowUp() wipes questionAudio, so set it afterwards.
+        viewModel.clearResultForFollowUp()
+        viewModel.updateQuestionAudio(recording.wav)
+        navController.navigate(ROUTE_LOADING)
     }
 
     val (badgeColor, badgeLabel) = when (confidence) {
@@ -143,14 +227,54 @@ private fun LandmarkResultScreen(
                 Text(text = responseText, color = TextSecondary, fontSize = 15.sp, lineHeight = 22.sp, modifier = Modifier.padding(16.dp))
             }
 
+            if (awaitingFollowUp) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MalaccaTeal.copy(alpha = 0.15f),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = when (viewModel.selectedLanguage) {
+                            "MS" -> "Mendengar — tanya soalan lanjut sekarang"
+                            else -> "Listening — ask a follow-up now"
+                        },
+                        color = MalaccaTeal,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                }
+            }
+
+            // Replay always stays: it is the only recovery if the spoken answer
+            // was missed, and the only route in when audio output fails.
             Button(onClick = { ttsManager.speak(responseText, viewModel.selectedLanguage) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark)) {
                 Text(text = replayText, color = MalaccaTeal, fontWeight = FontWeight.Medium)
             }
-            Button(onClick = { viewModel.clearResultForFollowUp(); navController.navigate(ROUTE_LISTENING) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MalaccaTeal)) {
-                Text(text = followText, color = TextPrimary, fontWeight = FontWeight.Medium)
-            }
-            Button(onClick = { viewModel.clearForNewSession(); navController.popBackStack(ROUTE_HOME, inclusive = false) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark)) {
-                Text(text = anotherText, color = TextPrimary, fontWeight = FontWeight.Medium)
+
+            // The other two are redundant once the glasses are driving the flow:
+            // follow-ups are spoken after the cue tone, and the temple button
+            // already starts a new landmark from this screen. They reappear
+            // whenever the glasses are not connected, which is also the phone
+            // camera fallback path.
+            if (!handsFree) {
+                Button(onClick = { viewModel.clearResultForFollowUp(); navController.navigate(ROUTE_LISTENING) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = MalaccaTeal)) {
+                    Text(text = followText, color = TextPrimary, fontWeight = FontWeight.Medium)
+                }
+                Button(onClick = { viewModel.clearForNewSession(); navController.popBackStack(ROUTE_HOME, inclusive = false) }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark)) {
+                    Text(text = anotherText, color = TextPrimary, fontWeight = FontWeight.Medium)
+                }
+            } else {
+                Text(
+                    text = when (viewModel.selectedLanguage) {
+                        "MS" -> "Tekan butang pada cermin mata untuk mercu tanda lain"
+                        else -> "Press the glasses button for another landmark"
+                    },
+                    color = TextSecondary,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
 
             Spacer(Modifier.height(16.dp))

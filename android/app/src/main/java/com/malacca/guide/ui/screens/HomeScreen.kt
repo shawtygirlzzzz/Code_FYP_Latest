@@ -59,6 +59,7 @@ import com.google.android.gms.location.LocationServices
 import com.malacca.guide.ble.ConnectionState
 import com.malacca.guide.ble.GlassesManager
 import com.malacca.guide.camera.CameraManager
+import com.malacca.guide.ui.components.BatteryIndicator
 import com.malacca.guide.ui.navigation.ROUTE_LISTENING
 import com.malacca.guide.ui.theme.BackgroundDark
 import com.malacca.guide.ui.theme.ErrorRed
@@ -84,8 +85,13 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
     val languages = listOf("EN", "MS")
 
     val glassesState by GlassesManager.connectionState.collectAsState()
+    // Re-ask on (re)connect, since onSdkReady may fire before this screen exists.
+    LaunchedEffect(glassesState) {
+        if (glassesState == ConnectionState.Connected) GlassesManager.refreshBattery()
+    }
     val scanResults by GlassesManager.scanResults.collectAsState()
     val audioAvailable by GlassesAudioRouter.headsetAvailable.collectAsState()
+    val battery by GlassesManager.batteryPercent.collectAsState()
     var showScanSheet by remember { mutableStateOf(false) }
     var capturing by remember { mutableStateOf(false) }
     val scanSheetState = rememberModalBottomSheetState()
@@ -96,6 +102,9 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
     LaunchedEffect(Unit) {
         GlassesAudioRouter.deactivate()
         GlassesAudioRouter.refreshAvailability()
+        // The glasses only volunteer a battery level every few minutes, so ask
+        // for a fresh one whenever the wearer is actually looking at this screen.
+        GlassesManager.refreshBattery()
     }
 
     val btPermLauncher = rememberLauncherForActivityResult(
@@ -356,24 +365,43 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
 
             Spacer(Modifier.height(40.dp))
 
+            // With the glasses connected the wearer starts a session from the
+            // temple button, so the on-screen control stops being the primary
+            // affordance. It stays tappable as a fallback — if the glasses
+            // button misbehaves, losing it entirely would leave no way in.
+            val handsFree = glassesState == ConnectionState.Connected
             Button(
                 onClick = { onMicTap() },
                 modifier = Modifier.size(120.dp),
                 shape = CircleShape,
-                colors = ButtonDefaults.buttonColors(containerColor = MalaccaTeal)
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (handsFree) SurfaceDark else MalaccaTeal
+                )
             ) {
                 Text(
-                    text = if (appMode == AppMode.RESTAURANT) "CAM" else "MIC",
-                    color = TextPrimary,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
+                    text = when {
+                        handsFree -> "PRESS\nGLASSES"
+                        appMode == AppMode.RESTAURANT -> "CAM"
+                        else -> "MIC"
+                    },
+                    color = if (handsFree) TextSecondary else TextPrimary,
+                    fontSize = if (handsFree) 13.sp else 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
                 )
             }
 
             Spacer(Modifier.height(20.dp))
 
             Text(
-                text = subtitleText,
+                text = if (handsFree) {
+                    when (selectedLanguage) {
+                        "MS" -> "Tekan butang pada cermin mata anda\n(atau ketuk di sini)"
+                        else -> "Press the button on your glasses\n(or tap here)"
+                    }
+                } else {
+                    subtitleText
+                },
                 color = TextSecondary,
                 fontSize = 14.sp,
                 textAlign = TextAlign.Center
@@ -416,7 +444,16 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
                 shape = RoundedCornerShape(8.dp)
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    Text(text = glassesText, color = glassesColor, fontSize = 13.sp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(text = glassesText, color = glassesColor, fontSize = 13.sp)
+                        // Reported by the glasses on event 0x05, and prompted via
+                        // addBatteryCallBack + syncBattery() on connect.
+                        battery?.let { BatteryIndicator(percent = it) }
+                    }
                     if (glassesState == ConnectionState.Connected) {
                         val audioText = if (audioAvailable) {
                             when (selectedLanguage) {

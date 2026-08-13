@@ -74,6 +74,9 @@ object GlassesManager {
     // Verified with the battery frame BC 73 03 00 54 61 | 05 4E 00 -> 0x4E = 78%.
     private const val EVENT_BATTERY = 0x05
 
+    /** Key under which our battery listener sits in the SDK's callback map. */
+    private const val BATTERY_CALLBACK_KEY = "malacca_guide"
+
     // A photo was captured on the glasses, followed by a little-endian image
     // count: BC 73 08 00 .. | 01 05 00 00 00 00 00 01. Observed incrementing by
     // exactly one per button press (2 -> 3 -> 4 -> 5).
@@ -277,9 +280,27 @@ object GlassesManager {
         LargeDataHandler.getInstance().syncDeviceInfo { _, _ ->
             Log.d(TAG, "syncDeviceInfo: completed")
         }
-        LargeDataHandler.getInstance().syncBattery()
+
+        // syncBattery() does NOT answer on the device-notify channel. It installs
+        // an internal handler that forwards to the separate registry filled by
+        // addBatteryCallBack(), so without this the reply is parsed and dropped
+        // and the level only appears when the glasses volunteer one (event 0x05,
+        // every few minutes).
+        LargeDataHandler.getInstance().addBatteryCallBack(BATTERY_CALLBACK_KEY) { _, response ->
+            val level = response?.battery
+            Log.d(TAG, "battery callback: $level% charging=${response?.isCharging}")
+            if (level != null && level in 0..100) _batteryPercent.value = level
+        }
+        refreshBattery()
 
         enableGlassesAudio()
+    }
+
+    /** Asks the glasses for their current battery level. Safe to call repeatedly. */
+    fun refreshBattery() {
+        if (_connectionState.value != ConnectionState.Connected) return
+        runCatching { LargeDataHandler.getInstance().syncBattery() }
+            .onFailure { Log.w(TAG, "refreshBattery failed: ${it.message}") }
     }
 
     /**

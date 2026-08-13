@@ -213,8 +213,13 @@ class GuideViewModel : ViewModel() {
         // Follow-ups reuse the known landmark, so a sharper photo buys nothing.
         if (landmarkContext.isNotBlank()) return false
         if (GlassesManager.connectionState.value != ConnectionState.Connected) return false
-        val confidence = result?.confidence?.lowercase()
-        return result == null || result.status == "error" || confidence == "low" || confidence == "unknown"
+
+        // Only a weak *identification* is worth another photo. A network failure
+        // or an AI outage is not: retrying spends six seconds and an extra
+        // capture on a problem a sharper image cannot solve.
+        if (result == null || result.status != "success") return false
+        val confidence = result.confidence?.lowercase()
+        return confidence == "low" || confidence == "unknown"
     }
 
     fun analyzeRestaurant() {

@@ -46,6 +46,20 @@ object VoiceRecorder {
     /** Ignore the first moments, where the SCO link is still settling. */
     private const val NOISE_FLOOR_SAMPLE_MS = 400L
 
+    /**
+     * Absolute floor for what counts as speech. Kept low on purpose: detection is
+     * driven mainly by the ratio to the measured noise floor, because speech level
+     * over this link varies enormously — one recording peaked at 27000, another at
+     * 1946 for the same speaker. A high fixed floor (1200 was tried) silently
+     * discarded the quieter one.
+     *
+     * The cue tone is no longer a concern here; it finishes before recording starts.
+     */
+    private const val MIN_SPEECH_LEVEL = 150.0
+
+    /** Consecutive frames above the threshold before speech is declared. */
+    private const val SPEECH_CONFIRM_FRAMES = 3
+
     data class Result(
         val wav: ByteArray,
         val durationMs: Long,
@@ -58,11 +72,15 @@ object VoiceRecorder {
      * Returns null if the recorder could not be opened.
      *
      * @param preferredDevice microphone to record from; null uses the default.
+     * @param noSpeechTimeoutMs how long to wait for the wearer to start speaking.
+     *   Shorter for the follow-up window, where silence is the normal outcome and
+     *   holding the microphone open is intrusive.
      */
     @SuppressLint("MissingPermission")
     suspend fun record(
         context: Context,
         preferredDevice: AudioDeviceInfo?,
+        noSpeechTimeoutMs: Long = NO_SPEECH_TIMEOUT_MS,
     ): Result? = withContext(Dispatchers.IO) {
         val minBuffer = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
@@ -110,6 +128,7 @@ object VoiceRecorder {
         var heardSpeech = false
         var noiseFloor = 0.0
         var noiseFloorFrames = 0
+        var loudFrames = 0
         var lastSpeechAt = 0L
         val startedAt = System.currentTimeMillis()
 
@@ -154,23 +173,33 @@ object VoiceRecorder {
                     continue
                 }
                 val threshold = if (noiseFloorFrames > 0) {
-                    ((noiseFloor / noiseFloorFrames) * 2.5).coerceAtLeast(250.0)
+                    ((noiseFloor / noiseFloorFrames) * 2.5).coerceAtLeast(MIN_SPEECH_LEVEL)
                 } else {
-                    400.0
+                    MIN_SPEECH_LEVEL
                 }
 
+                // Require the level to hold up across consecutive frames. A single
+                // loud frame is a click, a door, or the tail of our own cue tone;
+                // speech sustains.
                 if (mean > threshold) {
-                    if (!heardSpeech) Log.d(TAG, "record: speech started at ${elapsed}ms")
-                    heardSpeech = true
-                    lastSpeechAt = elapsed
+                    loudFrames++
+                    if (loudFrames >= SPEECH_CONFIRM_FRAMES) {
+                        if (!heardSpeech) {
+                            Log.d(TAG, "record: speech started at ${elapsed}ms (mean=${mean.toInt()} threshold=${threshold.toInt()})")
+                        }
+                        heardSpeech = true
+                        lastSpeechAt = elapsed
+                    }
+                } else {
+                    loudFrames = 0
                 }
 
                 if (heardSpeech && elapsed - lastSpeechAt > TRAILING_SILENCE_MS) {
                     Log.d(TAG, "record: trailing silence, stopping at ${elapsed}ms")
                     break
                 }
-                if (!heardSpeech && elapsed > NO_SPEECH_TIMEOUT_MS) {
-                    Log.d(TAG, "record: no speech within ${NO_SPEECH_TIMEOUT_MS}ms, stopping")
+                if (!heardSpeech && elapsed > noSpeechTimeoutMs) {
+                    Log.d(TAG, "record: no speech within ${noSpeechTimeoutMs}ms, stopping")
                     break
                 }
                 if (elapsed > MAX_DURATION_MS) {
