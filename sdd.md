@@ -1,11 +1,18 @@
 # System Design Document (SDD)
 # HeyCyan Malacca Tourist Guide App
 
-**Version:** 2.0  
-**Date:** April 2026  
+**Version:** 2.1  
+**Date:** August 2026  
 **Author:** [Your Name]  
 **Status:** Draft  
 **Related:** prd.md
+
+> **Revision note (v2.1).** Updated to match the implementation. Restaurant mode is
+> now a voice-driven recommendation rather than signage identification (§5.3); the
+> voice pipeline records audio and lets Gemini interpret it instead of using a
+> separate speech-to-text service (§2.2); and §10 has been rewritten with the BLE
+> protocol that the HeyCyan glasses actually use, which differs substantially from
+> the vendor documentation.
 
 ---
 
@@ -33,9 +40,9 @@ Android frontend must be fully tested with phone camera before glasses BLE is ad
 | Language | Python 3.11+ |
 | Framework | FastAPI |
 | Vision + LLM | Gemini 2.5 Flash (`gemini-2.5-flash`) |
-| Live voice API | Gemini 3.1 Flash Live (`gemini-3.1-flash-live-preview`) |
-| TTS | Gemini 3.1 Flash TTS (`gemini-3.1-flash-tts-preview`) |
-| Web search | Google Custom Search API or Brave Search API |
+| Speech understanding | Gemini 2.5 Flash — the recorded question is sent as an audio part alongside the image; no separate speech-to-text service |
+| TTS | Android `TextToSpeech`, routed to the glasses speaker |
+| Web search | Google Search grounding, enabled as a Gemini tool |
 | Database | Firebase Firestore |
 | Image storage | Firebase Cloud Storage |
 | Hosting | Google Cloud Run |
@@ -49,9 +56,10 @@ Android frontend must be fully tested with phone camera before glasses BLE is ad
 | Navigation | Jetpack Navigation Compose |
 | HTTP client | Retrofit 2 + OkHttp |
 | Camera (Phase 2) | CameraX |
-| BLE (Phase 3) | HeyCyan SDK (.aar) |
-| STT | Android SpeechRecognizer → Gemini Live API (WebSocket) |
-| TTS | Android TextToSpeech → Gemini TTS API |
+| BLE (Phase 3) | HeyCyan / Oudmon SDK (`glasses_sdk_20250723_v01.aar`) |
+| Audio capture | `AudioRecord` with `setPreferredDevice` pinned to the glasses microphone, written to WAV and uploaded. Replaced Android `SpeechRecognizer`, which chose the phone microphone regardless of routing and returned `NO_MATCH` on clean Bluetooth audio — see §10.4 |
+| Audio routing | `AudioManager.setCommunicationDevice` (API 31+) / Bluetooth SCO, pinning capture and playback to the glasses |
+| TTS | Android `TextToSpeech` with `USAGE_VOICE_COMMUNICATION` so playback follows the pinned route |
 | State management | ViewModel + StateFlow |
 | Local cache | Room Database |
 | Auth | Firebase Auth (anonymous) |
@@ -151,15 +159,21 @@ malacca-android/
 │   │       │       ├── LandmarkCard.kt     # Result card component
 │   │       │       └── ErrorBanner.kt      # Error message component
 │   │       ├── ble/
-│   │       │   ├── GlassesManager.kt       # HeyCyan BLE wrapper (Phase 3)
-│   │       │   └── BleStateManager.kt      # BLE connection state
+│   │       │   ├── GlassesManager.kt       # Scan, connect, capture, device events
+│   │       │   ├── ConnectionState.kt      # BLE connection state enum
+│   │       │   ├── MyBluetoothReceiver.kt  # SDK broadcasts (onServiceDiscovered)
+│   │       │   ├── BluetoothReceiver.kt    # System Bluetooth state
+│   │       │   ├── GlassesWifiManager.kt   # WiFi Direct group (full-res fallback)
+│   │       │   └── GlassesMediaDownloader.kt # HTTP pull from the glasses
 │   │       ├── api/
 │   │       │   ├── ApiClient.kt            # Retrofit + OkHttp setup
 │   │       │   ├── ApiService.kt           # Endpoint definitions
 │   │       │   └── models/
 │   │       │       └── ApiModels.kt        # Request/response data classes
 │   │       ├── voice/
-│   │       │   ├── SttManager.kt           # Speech-to-text manager
+│   │       │   ├── VoiceRecorder.kt        # AudioRecord -> WAV, own silence detection
+│   │       │   ├── GlassesAudioRouter.kt   # Pins capture/playback to the glasses
+│   │       │   ├── Earcon.kt               # Cue tone when the follow-up window opens
 │   │       │   └── TtsManager.kt           # Text-to-speech manager
 │   │       ├── camera/
 │   │       │   └── CameraManager.kt        # CameraX wrapper (Phase 2)
@@ -185,10 +199,16 @@ Accepts an image and a text query. Returns an AI-generated tourist guide respons
 
 **Request** (`multipart/form-data`):
 ```
-image   : File    (JPEG or PNG, max 5MB)
-query   : string  (default: "What is this building? Tell me about it.")
-language: string  (default: "en")
+image           : File    (JPEG or PNG, max 5MB)
+query           : string  (default: "What is this building? Tell me about it.")
+language        : string  (default: "en")
+landmark_context: string  (optional — set on follow-ups so the landmark is not re-identified)
+audio           : File    (optional WAV of the spoken question, max 10MB)
 ```
+
+When `audio` is present it takes precedence over `query`: Gemini receives the image
+and the recording together and answers the spoken question directly, with no separate
+transcription step.
 
 **Response** (`application/json`):
 ```json
@@ -200,6 +220,12 @@ language: string  (default: "en")
   "confidence": "high"
 }
 ```
+
+`landmark_name` and `confidence` are stated by the model itself on two header lines,
+which the backend parses out and strips before returning `response`. They are not
+inferred from the prose: an earlier heuristic searched for the phrase "cannot
+identify", which "cannot **confidently** identify" does not contain, so refusals were
+returned as high confidence. `landmark_name` is `null` when the model reports UNKNOWN.
 
 **Error response:**
 ```json
@@ -223,47 +249,77 @@ Health check endpoint for Cloud Run.
 ---
 
 ### 5.3 `POST /restaurant`
-Accepts an image of a restaurant or cafe facade. Uses Gemini Vision to extract the restaurant name from signage, then fetches details from Google Places API.
+Accepts a **recorded spoken request** plus the tourist's GPS position, and returns
+nearby places matching what they asked for. **No image is involved** — see PRD §3.4
+for why this replaced signage identification.
+
+Two-stage pipeline, deliberately splitting language understanding from facts:
+
+1. **Gemini** listens to the audio and turns it into a structured search
+   (`{ query, open_now, price_ceiling, radius_m, rank_by }`). It does **not** name
+   any restaurants — an LLM asked to do that will invent plausible ones.
+2. **Google Places** `searchText` runs that search, biased to the GPS position, and
+   returns real places. Every name, rating, price and opening time comes from here.
 
 **Request** (`multipart/form-data`):
 ```
-image    : File    (JPEG or PNG, max 5MB)
-lat      : float   (device GPS latitude)
-lng      : float   (device GPS longitude)
-language : string  (default: "en")
+audio             : File    (WAV, 16 kHz mono, max 10MB) — the spoken request
+query             : string  (optional text fallback when no audio was captured)
+lat               : float   (device GPS latitude)
+lng               : float   (device GPS longitude)
+language          : string  (default: "en")
+exclude_place_ids : string  (optional, comma-separated — used when refining)
 ```
 
 **Response** (`application/json`):
 ```json
 {
   "status": "success",
-  "type": "restaurant",
-  "restaurant_name": "Jonker 88",
-  "place_id": "ChIJxxxxxxxxxxxxxxxx",
-  "rating": 4.3,
-  "review_count": 1247,
-  "top_review": "Must try the cendol and laksa here!",
-  "price_level": 1,
-  "opening_hours": "Open now · Closes 10 PM",
-  "cuisine": "Malaysian, Local Food",
-  "response": "This is Jonker 88, a popular local eatery rated 4.3 stars with over 1,200 reviews. Known for cendol and chicken rice ball. Currently open until 10 PM.",
+  "understood_as": "cafe serving pancakes, open now",
+  "alternatives": [
+    {
+      "name": "The Daily Fix Cafe",
+      "rating": 4.4,
+      "review_count": 2130,
+      "price_level": 2,
+      "distance_m": 180,
+      "opening_hours": "Open now · Closes 6 PM",
+      "cuisine": "Cafe",
+      "place_id": "ChIJyyyyyyyyyyyyyyyy"
+    }
+  ],
+  "response": "I found three cafes serving pancakes near you. The Daily Fix Cafe, rated 4.4 stars from over 2,000 reviews, about 180 metres away, moderately priced, open until 6 PM...",
   "session_id": "abc123"
 }
 ```
+
+`understood_as` echoes back Gemini's interpretation of the request. It is spoken only
+when confidence is low ("I looked for cafes serving pancakes — is that right?"), and
+is otherwise used for debugging misheard questions.
 
 **Error response:**
 ```json
 {
   "status": "error",
-  "message": "Could not identify a restaurant from this image. Try a closer angle on the signage.",
+  "message": "I couldn't find anywhere serving that nearby. Try asking for something more general.",
   "session_id": null
 }
 ```
 
+**Ranking.** "Best" combines rating with review count so that 5.0 from 3 reviews does
+not outrank 4.5 from 800. Places with fewer than a minimum number of reviews are
+ranked below established ones rather than excluded.
+
+**Empty results.** A narrow request ("pancakes") may match nothing within the radius.
+The backend widens the search and says so, rather than reporting failure.
+
 ---
 
 ### 5.4 `POST /restaurant/nearby`
-Returns up to 3 alternative restaurants or cafes near the tourist's current GPS location. Called when the tourist declines the currently identified restaurant.
+Returns up to 3 restaurants or cafes near the tourist's current GPS location, with no
+spoken preference. Used when the tourist asks something open-ended ("where should I
+eat?") or when `/restaurant` needs a fallback because the request could not be
+interpreted. Unchanged from v2.0 apart from its role.
 
 **Request** (`application/json`):
 ```json
@@ -385,8 +441,9 @@ GEMINI_API_KEY=your_gemini_api_key_here
 |---|---|---|---|
 | Landmark identification | `gemini-2.5-flash` | REST (multimodal) | Stable, production-safe |
 | LLM answer generation | `gemini-2.5-flash` | REST | Same call as vision |
-| Voice input (STT) | `gemini-3.1-flash-live-preview` | WebSocket (Live API) | Preview — monitor deprecation |
-| Voice output (TTS) | `gemini-3.1-flash-tts-preview` | REST | Preview — fallback to Android TTS |
+| Voice input | `gemini-2.5-flash` | REST (audio part) | The recording is sent with the image; Gemini answers the spoken question directly. No separate STT service — Android's on-device recogniser returned `NO_MATCH` on clean Bluetooth audio |
+| Request interpretation (restaurant) | `gemini-2.5-flash` | REST (audio part) | Turns the spoken request into a structured Places search. Never names restaurants itself |
+| Voice output (TTS) | Android `TextToSpeech` | on-device | Routed to the glasses speaker; no cloud TTS needed |
 | Web search grounding | Built into Gemini tool use | REST | Enable `google_search` tool |
 
 ---
@@ -486,12 +543,17 @@ LaunchedEffect(Unit) {
 - `isLoading: Boolean` → disable button while loading
 - `appMode: AppMode` → `LANDMARK` or `RESTAURANT` (controls which endpoint is called)
 
-**On mic button tap:**
-- Navigate to `ListeningScreen`
-- Start `SttManager.startListening()`
-- Trigger camera capture (phone CameraX in Phase 2, glasses BLE in Phase 3)
-- If `appMode == LANDMARK` → calls `POST /analyze`
-- If `appMode == RESTAURANT` → calls `POST /restaurant` with GPS coordinates
+**On mic button tap, or a press of the button on the glasses:**
+- If `appMode == LANDMARK` → capture a photo (glasses BLE, or phone CameraX as
+  fallback), then navigate to `ListeningScreen` → `POST /analyze`
+- If `appMode == RESTAURANT` → **no photo is taken**. Fetch GPS, navigate straight to
+  `ListeningScreen` → `POST /restaurant`. This is what makes restaurant mode faster
+  than landmark mode: it skips the ~6s Bluetooth image transfer entirely.
+
+The glasses button is handled at the navigation-graph level rather than inside a
+screen, so it works while the wearer is looking at a landmark rather than the phone.
+It always starts a **new** subject, in either mode; follow-ups are spoken, never
+pressed (see §9.2a).
 
 **Error states:**
 - No internet → show `ErrorBanner("No internet connection")`
@@ -663,6 +725,43 @@ data class NearbyResult(
 
 ---
 
+### 9.2a Hands-free follow-up (F16)
+
+Follow-ups are spoken, not tapped. After every successful answer:
+
+```
+TTS finishes speaking
+    |
+    v
+Cue tone through the glasses (Earcon)
+    |
+    v
+Wait ~450ms so the tone is not recorded    <-- the glasses mic sits inches
+    |                                          from the glasses speaker
+    v
+Listen for up to 4 seconds
+    |
+    +-- speech heard  --> follow-up: reuse the image and landmarkContext,
+    |                     skip the capture, go to LoadingScreen
+    |
+    +-- silence       --> stay on ResultScreen, do nothing
+```
+
+Design decisions worth recording:
+
+- **The button always means "new subject".** An earlier design had the button mean
+  "follow-up" while a result was on screen, which broke the moment the tourist walked
+  to a different landmark and pressed it expecting a photo. Speaking to continue and
+  pressing to restart are two actions that never compete.
+- **No cue tone after a failure.** A backend or AI error still returns a result
+  object; offering a follow-up about a failure is worse than staying silent.
+- **Speech detection is level-based**, calibrated against the room's noise floor with
+  an absolute minimum. On this hardware a spoken question peaks near 27000 while
+  Bluetooth idle hiss reaches 2500, so a permissive threshold made the cue tone
+  trigger a follow-up by itself.
+
+---
+
 #### Screen 6 — HistoryScreen (Phase 4)
 **File:** `ui/screens/HistoryScreen.kt`  
 **Purpose:** List of all past landmark interactions for this tourist.
@@ -742,16 +841,28 @@ val bleConnected: StateFlow<Boolean>
 val appMode: StateFlow<AppMode>               // current mode toggle state
 val sessions: StateFlow<List<SessionEntity>>  // for HistoryScreen
 
-// Key functions:
-fun startListening()                          // triggers STT + camera
-fun stopListening()                           // manual stop
+// Key functions (as implemented in GuideViewModel):
 fun setMode(mode: AppMode)                    // switch landmark / restaurant mode
-fun analyzeImage(bitmap: Bitmap, query: String)           // calls POST /analyze
-fun analyzeRestaurant(bitmap: Bitmap, lat: Double, lng: Double)  // calls POST /restaurant
-fun findNearbyRestaurants(lat: Double, lng: Double, excludePlaceId: String)  // calls POST /restaurant/nearby
-fun replayTts()                               // re-speaks last response
-fun loadHistory()                             // loads Room DB sessions
+fun storeBitmap(bitmap: Bitmap)               // photo pulled from the glasses
+fun updateQuestionAudio(wav: ByteArray?)      // recorded question, null if silent
+fun updateLocation(lat: Double, lng: Double)  // GPS for restaurant mode
+fun analyze()                                 // POST /analyze  (image + audio)
+fun analyzeRestaurant()                       // POST /restaurant (audio + GPS)
+fun findNearby(excludePlaceId: String)        // POST /restaurant/nearby
+fun clearResultForFollowUp()                  // keeps landmarkContext, clears the answer
+fun clearForNewSession()                      // full reset
 ```
+
+**Note on naming.** The implementation uses a single `GuideViewModel` rather than
+`MainViewModel`, and exposes Compose `mutableStateOf` fields directly rather than a
+sealed `AppUiState`. The state machine described above proved unnecessary once the
+navigation graph itself carried the flow.
+
+**Low-confidence retry.** After `/analyze` returns, if the model reports `low` or
+`unknown` confidence and the glasses are connected, the ViewModel retakes the photo
+at full resolution over WiFi Direct and asks once more before publishing a result.
+It deliberately does *not* retry on backend or AI errors — a sharper image cannot fix
+an outage, and the retry costs a further six seconds and an extra capture.
 
 ---
 
@@ -816,33 +927,110 @@ Every screen must handle these gracefully (never crash):
 | Unknown landmark | ResultScreen | Red badge + "I couldn't identify this landmark." |
 | BLE disconnected | HomeScreen | Bottom indicator updates to "Glasses disconnected" |
 | Backend 500 error | LoadingScreen | Navigate Home: "Something went wrong. Try again." |
-| Restaurant not found in Places | ResultScreen | ErrorBanner: "Couldn't find this restaurant online. Try a closer shot of the signage." |
+| Spoken request not understood | ListeningScreen | TTS: "I didn't catch that." Falls back to an open-ended nearby search rather than failing |
 | Location permission denied | HomeScreen (restaurant mode) | ErrorBanner: "Location access needed to find nearby restaurants." |
-| No nearby results | ResultScreen | TTS: "I couldn't find any open restaurants nearby right now." |
+| No match for the stated preference | ResultScreen | Backend widens the search and says so: "I couldn't find pancakes nearby, but here are some cafes." |
+| No nearby results at all | ResultScreen | TTS: "I couldn't find any open restaurants nearby right now." |
+| Glasses audio route unavailable | ListeningScreen | Falls back to the phone microphone; the interaction still works, but is not hands-free |
+| AI service overloaded | LoadingScreen | TTS speaks the error; **no cue tone**, so no follow-up is offered |
 
 ---
 
-## 10. BLE Communication (HeyCyan SDK — Phase 3 only)
+## 10. BLE Communication (HeyCyan / Oudmon SDK)
 
-### Connection flow
-```
-1. App scans for BLE devices (QCCentralManager)
-2. User selects glasses from list
-3. App connects (QCCentralManager.connect)
-4. App triggers photo: setDeviceMode(Photo)
-5. SDK callback fires with photo data
-6. App sends photo bytes to /analyze
-7. Backend returns text response
-8. TtsManager speaks response through phone speaker
-```
+The vendor AAR ships with no documentation or sources. Everything below was
+established by decompiling `glasses_sdk_20250723_v01.aar` with `javap` and by
+observing live traffic on a W610, and differs from the class names assumed in v2.0.
 
-### Key SDK classes (Android)
+### 10.1 Key SDK classes (Android)
 ```kotlin
-QCCentralManager      // BLE scan + connect
-QCSDKManager          // Singleton, receives callbacks
-QCSDKManagerDelegate  // Interface: onPhotoReceived, onBatteryUpdate, etc.
-QCSDKCmdCreator       // Send commands: photo, video, audio mode
+BleOperateManager            // BLE connect / disconnect, init
+BleScannerHelper             // BLE scan with ScanWrapperCallback
+LargeDataHandler             // Feature commands + the large-data channel
+GlassesDeviceNotifyListener  // Unprompted device events (subclass and register)
+QCBluetoothCallbackCloneReceiver // SDK broadcasts, incl. onServiceDiscovered
 ```
+
+`LargeDataHandler.initEnable()` **must** be called from `onServiceDiscovered()`.
+Until it runs, the glasses accept writes but never reply.
+
+### 10.2 Connection flow
+```
+1. Scan, filtering on name prefixes (W610, G300, G3, M01, QCY)
+2. BleOperateManager.connectDirectly(address)
+3. onServiceDiscovered() -> LargeDataHandler.initEnable()
+4. Register a GlassesDeviceNotifyListener via addOutDeviceListener()
+5. syncTime, syncDeviceInfo, syncBattery
+6. openBT() + syncClassicBluetooth() to bring up the classic-BT audio radio
+```
+
+Step 6 matters: the BLE link carries **control data only**. Audio travels over a
+separate classic Bluetooth A2DP/HFP connection, which stays off until requested.
+
+### 10.3 Device notify frame format (`cmdType 115 / 0x73`)
+```
+[0]=0xBC magic  [1]=0x73 action  [2..3]=payload length LE
+[4..5]=checksum [6]=event code   [7..]=event payload
+```
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `0x01` | uint32 LE image count | A photo was captured on the glasses |
+| `0x02` | uint32 LE byte count | Image data prepared and about to stream |
+| `0x03` | — | The glasses' own voice recording started |
+| `0x05` | uint8 percent | Battery level |
+| `0x0A` | — | Voice recording finished |
+
+Verified against a battery frame: `BC 73 03 00 54 61 | 05 4E 00` → `0x4E` = 78%.
+
+`0x01` is what the wearer's button press raises, confirmed by watching the image
+count increment by exactly one per press. The app treats it as "start a session".
+
+Events `0x03`/`0x0A` bracket roughly 19 kbps of audio streamed on
+`ACTION_GPT_UPLOAD` (0x59) — the glasses' own assistant shipping voice out for
+someone else to transcribe. **The app does not consume this channel**; it captures
+audio over the HFP microphone instead. It remains a fallback if SCO proves
+unreliable.
+
+### 10.4 Photo retrieval — a two-phase exchange
+
+`LargeDataHandler.getPictureThumbnails()` looks like a single call but is not, and
+this is not documented anywhere:
+
+```
+1. Set the thumbnail size    -> glassesControl([0x02,0x01,0x06,size,size,0x02])
+2. First getPictureThumbnails() -> the glasses answer "0 packets available"
+                                   and begin GENERATING the image (~2s)
+3. Device notify 0x02 arrives   -> image ready, with its byte count
+4. Second getPictureThumbnails() -> the data finally streams
+5. ~1KB chunks arrive via the callback, success=false for each,
+   success=true on the last one — each carrying only its own slice
+```
+
+Two consequences the SDK's shape actively hides:
+
+- **Chunks must be concatenated by the caller.** The final callback contains only
+  the last packet. Keeping just that yields a truncated JPEG that decodes to null.
+- **Only one thumbnail callback can be registered at a time.** A second
+  `getPictureThumbnails()` call replaces the first, so issuing one from the notify
+  listener while a pull is in flight silently redirects the data.
+
+Skipping step 1 makes the glasses report zero packets forever, and the SDK then
+never invokes the callback at all — the request simply times out.
+
+Typical result: ~50–80 KB, 1088×816, about 5 seconds end to end.
+
+### 10.5 Audio routing
+
+`AudioManager.setCommunicationDevice()` returning `true` means only that the request
+was accepted, not that the route is live — SCO needs 0.5–2s more. The app polls
+`communicationDevice` until it reports the glasses, and re-checks before every
+session because the system tears the route down when the previous user of the audio
+input releases it.
+
+Playback has an automatic fallback (media audio goes to A2DP when the glasses are
+paired), so hearing the answer through the glasses does **not** prove routing works.
+Only capture is diagnostic.
 
 ### Required Android permissions (`AndroidManifest.xml`)
 ```xml
@@ -939,19 +1127,21 @@ in the current phase pass.
 | 2.24 | Wire all error states to `ErrorBanner` component | Each error shows correct message on correct screen |
 | 2.25 | Add timeout handling (10s backend timeout) | App navigates back to Home on timeout |
 
-#### 2H — Restaurant & Cafe Discovery (F06, F07)
+#### 2H — Voice-Driven Food Recommendation (F06, F07)
 | Step | Task | Success Check |
 |---|---|---|
 | 2.29 | Add `ACCESS_FINE_LOCATION` runtime permission request to Android | Device prompts user for location on first launch |
-| 2.30 | Add GPS coordinate fetch to `MainViewModel` | `lat`/`lng` values available before restaurant call |
-| 2.31 | Add `RestaurantRequest` + `RestaurantResponse` + `PlaceAlternative` to `ApiModels.kt` | Data classes match `POST /restaurant` and `POST /restaurant/nearby` schemas |
-| 2.32 | Add `/restaurant` and `/restaurant/nearby` endpoints to `ApiService.kt` | Retrofit definitions compile without error |
+| 2.30 | Add GPS coordinate fetch to the ViewModel | `lat`/`lng` available before the restaurant call |
+| 2.31 | Add `PlaceAlternative` + recommendation response to `ApiModels.kt` | Data classes match the `POST /restaurant` schema in §5.3 |
+| 2.32 | Add `/restaurant` and `/restaurant/nearby` to `ApiService.kt` | Retrofit definitions compile without error |
 | 2.33 | Add mode toggle (Landmark / Restaurant) to `HomeScreen.kt` | Toggling changes `appMode` state in ViewModel |
-| 2.34 | Wire restaurant mode → `POST /restaurant` call with GPS | Restaurant name, rating, hours returned and shown on ResultScreen |
-| 2.35 | Build restaurant variant of `ResultScreen.kt` | Rating, price level, opening hours displayed correctly |
-| 2.36 | Wire "Find Nearby" button → `POST /restaurant/nearby` | 3 alternative restaurants listed and spoken via TTS |
-| 2.37 | Test restaurant flow end-to-end on Jonker Street photo | Correct restaurant identified, details accurate, TTS speaks response |
-| 2.38 | Test "Find Nearby" with a known location | 3 alternatives returned within ~200m, spoken aloud |
+| 2.34 | Skip image capture in restaurant mode; go straight to listening | No photo is pulled; the flow reaches ListeningScreen in well under a second |
+| 2.35 | Backend: Gemini interprets the recording into a structured search | Spoken "best cafe with pancakes" yields `{query, open_now, rank_by}` |
+| 2.36 | Backend: Google Places `searchText` with GPS bias; rank and format | Real places returned with rating, review count, distance, hours |
+| 2.37 | Reuse `NearbyPlaceCard` list UI for the results | Names, stars, distance, price and hours all render |
+| 2.38 | Wire spoken refinement ("anything cheaper?") through the follow-up window | Second request narrows the previous results without touching the phone |
+| 2.39 | Verify no place is ever invented | Every name in the spoken response has a `place_id` from Places |
+| 2.40 | Test end-to-end on Jonker Street | Relevant, open, walkable suggestions spoken through the glasses |
 
 #### 2G — Full End-to-End Test (Phone Camera)
 | Step | Task | Success Check |
