@@ -63,6 +63,15 @@ async def analyze(
             confidence=result["confidence"],
         )
     except ClientError as e:
+        # 429 is a 4xx, so it lands here alongside genuine bad requests. Telling
+        # the tourist to "try a closer angle" when the photo was fine and the free
+        # tier simply ran out of quota sends them chasing the wrong problem.
+        if getattr(e, "code", None) == 429:
+            logger.warning("Gemini rate limit hit: %s", e)
+            return AnalyzeResponse(
+                status="error",
+                message="Too many requests right now. Please wait a moment and ask again.",
+            )
         logger.error("Gemini client error: %s", e)
         return AnalyzeResponse(
             status="error",

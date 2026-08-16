@@ -1,11 +1,30 @@
+import logging
 import os
+import time
 from google import genai
 from google.genai import types
 from services.search import build_search_tool
 
+logger = logging.getLogger(__name__)
+
+# Measured on the same photograph, image + audio, free tier:
+#   gemini-2.5-flash        ~28s   (heavily congested; 503s were common)
+#   gemini-3.5-flash          5.9s
+#   gemini-3.5-flash-lite     5.1s
+#   gemini-flash-lite-latest  3.7s
+# All identified the landmark correctly and honoured the header format.
+# The latency was never prompt or config related — search grounding and model
+# thinking were both ruled out by measurement — it was capacity on the model
+# 2.5-flash was serving from.
+#
+# A pinned name is used rather than the "-latest" alias so results stay
+# reproducible: an alias silently moves to a different model over time.
+VISION_MODEL = "gemini-3.5-flash-lite"
+
 SYSTEM_PROMPT = """You are HeyCyan, an expert AI tourist guide specialising in Malacca (Melaka), Malaysia.
-You know Malacca's landmarks, museums, temples, mosques, streets and monuments well, and you
-have Google Search available to confirm details.
+You know Malacca's landmarks, museums, temples, mosques, streets and monuments well. Google
+Search is available when answering follow-up questions, where current details such as ticket
+prices and opening hours matter; identification itself relies on your own knowledge.
 
 When given an image:
 1. Examine it carefully before naming anything: type of structure (gate/arch, church, temple,
@@ -118,7 +137,10 @@ def analyze_landmark(
             f"The tourist is currently at {landmark_context}. "
             f"They are asking a follow-up question. "
             f"Do NOT re-identify or re-describe the landmark. "
-            f"Answer the tourist's specific question directly and concisely.\n\n"
+            f"Answer the tourist's specific question directly and concisely. "
+            f"You have Google Search available — use it for anything that changes over "
+            f"time, such as ticket prices, opening hours or closures, and say plainly if "
+            f"you cannot confirm a current figure.\n\n"
             f"Tourist question: {base_query}\n\n"
             f"Still use the two header lines, with LANDMARK: {landmark_context}.\n"
             f"IMPORTANT: Write the description entirely in {lang_name}."
@@ -129,19 +151,39 @@ def analyze_landmark(
             f"features such as cannons, statues, whether it is a gate or a church, and its "
             f"elevation before naming it. Consult the disambiguation notes only if the image "
             f"resembles one of the sites listed there; otherwise rely on your own knowledge "
-            f"of Malacca and web search.\n\n"
+            f"of Malacca.\n\n"
             f"Tourist question: {base_query}\n\n"
             f"IMPORTANT: Write the description entirely in {lang_name}."
         )
 
+    # Search grounding is reserved for follow-up questions.
+    #
+    # Identifying a landmark is a vision task: the model matches the photograph
+    # against what it already knows, and the search tool only takes text queries,
+    # so it cannot help with recognition. Grounding every identification made
+    # calls take 30-70s and is billed per request. Follow-ups are where current
+    # information genuinely lives — ticket prices, opening hours — so the tool is
+    # given only when a landmark_context marks the request as a follow-up.
+    use_search = bool(landmark_context)
+    tools = [build_search_tool()] if use_search else None
+    logger.info(
+        "analyze_landmark: follow_up=%s search_grounding=%s audio=%s",
+        bool(landmark_context), use_search, bool(audio_bytes),
+    )
+
+    started = time.perf_counter()
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=VISION_MODEL,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             temperature=0.4,
-            tools=[build_search_tool()],
+            tools=tools,
         ),
         contents=_build_contents(image_bytes, user_prompt, audio_bytes, audio_mime),
+    )
+    logger.info(
+        "analyze_landmark: Gemini responded in %.1fs (search_grounding=%s)",
+        time.perf_counter() - started, use_search,
     )
 
     raw_text = response.text.strip().replace("**", "")
