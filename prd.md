@@ -1,11 +1,16 @@
 # Product Requirements Document (PRD)
 # HeyCyan Malacca Tourist Guide App
 
-**Version:** 1.1  
+**Version:** 1.2  
 **Date:** August 2026  
 **Author:** [Your Name]  
 **Status:** Draft
 
+> **Revision note (v1.2).** Every feature now carries an implementation status, and
+> §3.5 records which requirements were delivered, which were dropped, and why. F06
+> and F07 are **not implemented** — Google Places requires paid billing that became
+> unavailable mid-project, and the free alternative was evaluated and rejected.
+>
 > **Revision note (v1.1).** Restaurant mode was redesigned from photographing
 > signage to asking for a recommendation by voice (F06, F07), and the voice input
 > description was corrected to match what was built. See §3.4 for the rationale.
@@ -68,18 +73,18 @@ than a series of separate lookups.
 
 ### 3.1 Must Have (MVP — Phase 1, 2 & 3)
 
-| # | Feature | Description |
-|---|---|---|
-| F01 | Landmark identification | Capture image via glasses, identify building using Gemini Vision |
-| F02 | Voice input | Tourist's question is recorded from the glasses microphone and sent to the backend as audio. Gemini interprets the recording directly, so no separate speech-to-text step is required. |
-| F03 | AI response | LLM generates a tourist-friendly answer with historical info |
-| F04 | Voice output (TTS) | AI response is spoken back through glasses speaker |
-| F05 | Web search grounding | LLM searches the web for ticket prices, opening hours, current info |
-| F06 | Voice-driven food recommendation | Tourist asks for somewhere to eat matching a preference, e.g. "where is the best cafe that serves pancakes here?". The app sends the recording plus GPS to the backend. Gemini interprets the request into a search; Google Places returns real nearby matches. The app speaks back names, star ratings, review counts, price level, distance and opening hours. No photograph required. |
-| F07 | Refining recommendations | Tourist narrows or widens the results by voice — "anything cheaper?", "what else is nearby?", "somewhere closer" — without touching the phone. |
-| F08 | BLE glasses connection | Android app connects to HeyCyan glasses via Bluetooth LE |
-| F09 | Session saving | Each interaction (image + query + response) is saved to database |
-| F16 | Hands-free follow-up | After each spoken answer the app plays a short cue tone and listens briefly. Speaking continues the conversation about the same subject; saying nothing ends it. The glasses button always starts a new subject, so the two actions never conflict. |
+| # | Feature | Status | Description |
+|---|---|---|---|
+| F01 | Landmark identification | ✅ Implemented | Capture image via glasses, identify building using Gemini vision |
+| F02 | Voice input | ✅ Implemented | Question recorded from the glasses microphone and sent to the backend as audio. Gemini interprets the recording directly, so no separate speech-to-text step exists |
+| F03 | AI response | ✅ Implemented | LLM generates a tourist-friendly answer with historical information |
+| F04 | Voice output (TTS) | ✅ Implemented | Answer spoken back through the glasses speaker |
+| F05 | Web search grounding | ✅ Implemented (follow-ups only) | Search is enabled for follow-up questions, where current information such as ticket prices lives. It is deliberately **disabled for identification**, which is a vision task the search tool cannot assist with, and is billed per request |
+| F06 | Voice-driven food recommendation | ❌ **Not implemented** | Specified in §3.4 and SDD §5.3 but never built. Google Places requires paid billing which expired mid-project; OpenStreetMap was evaluated as a free replacement and rejected (§3.5) |
+| F07 | Refining recommendations | ❌ **Not implemented** | Depends on F06 |
+| F08 | BLE glasses connection | ✅ Implemented | Scan, connect, device events, battery, and classic-Bluetooth audio bring-up |
+| F09 | Session saving | ❌ **Not implemented** | Phase 4 was not reached. No Firestore, Room persistence or history screen |
+| F16 | Hands-free follow-up | ✅ Implemented | After each successful answer the app plays a cue tone and listens briefly. Speaking continues the conversation; silence ends it. The glasses button always starts a new subject, so the two never conflict |
 
 ### 3.2 Nice to Have (Phase 4+)
 
@@ -123,6 +128,55 @@ Reasons for the change:
 Ratings, review counts, prices and opening hours still come from Google Places, so
 the factual content of the response is unchanged. What changes is how the candidate
 places are chosen: by spoken preference rather than by photographed name.
+
+### 3.5 Implementation Status and Dropped Requirements
+
+**Delivered:** F01–F05, F08, F16. The complete hands-free loop works: the wearer
+presses the button on the glasses, the photograph is pulled over Bluetooth, the
+question is captured by the glasses microphone, and the answer is spoken through the
+glasses speaker. Follow-up questions are spoken, not tapped.
+
+**Dropped: F06 and F07 (restaurant / food recommendation).**
+
+The feature depends on a place database with ratings. The chain of events was:
+
+1. Google Places API (New) began returning `403 PERMISSION_DENIED`. Diagnosis showed
+   this was **not** a quota problem but an authorisation one: the project's free trial
+   had expired, and Maps Platform refuses all calls without active billing.
+2. Paid billing was not available for this project.
+3. **OpenStreetMap was evaluated** as a free replacement, using the Overpass API on
+   the Jonker Street area (600m radius). Measured results:
+
+   | | Coverage |
+   |---|---|
+   | Named places found | 79 |
+   | Recording their cuisine | 27 of 79 (34%) |
+   | Recording opening hours | 11 of 79 (14%) |
+   | **Star ratings / review counts** | **none — OSM holds no rating data** |
+
+   Query latency was 37 seconds on a mirror; the primary endpoint returned `504`.
+
+4. Without ratings, "where is the *best* cafe" degrades to "here is the *nearest*
+   cafe", and with only a third of places recording cuisine, filtering by a stated
+   preference fails for most results. The feature could not be delivered honestly, so
+   it was withdrawn rather than shipped in a misleading form.
+
+The Places-based implementation remains in the repository (`services/places.py`,
+`routers/restaurant.py`) as a record of the original design.
+
+**Dropped: F09 (session saving).** Phase 4 was not reached. Effort was directed at
+completing and validating the glasses integration instead, which is the component the
+project's contribution rests on.
+
+**Alternatives considered and rejected** during the search for a replacement feature,
+recorded because the reasoning is itself a finding:
+
+| Candidate | Why rejected |
+|---|---|
+| Sign / menu translation | Malacca's signage is already multilingual by law and convention. Street signs carry Malay, Jawi, Chinese, Tamil **and English**; menus are predominantly bilingual. A translator would restate what the sign already says |
+| Dish identification | Technically feasible but a thin variant of F01 — image in, description out — with no distinct logic |
+| AI trip planner | Does not use the camera at all, so nothing about it requires smart glasses |
+| GPS-triggered audio tour | Viable, and remains the strongest future extension (F14), but GPS accuracy among the old town's shophouses (10–20m) cannot separate landmarks in Dutch Square without fusing camera confirmation |
 
 ---
 
@@ -203,16 +257,43 @@ So that the app suggests options rather than requiring me to name a dish.
 
 ## 7. Success Metrics (MVP)
 
-| Metric | Target |
-|---|---|
-| Landmark identification accuracy | ≥ 90% for top 20 landmarks |
-| Spoken question understood correctly | ≥ 90% of requests |
-| Recommendation relevance | ≥ 80% of suggested places match the stated preference |
-| Recommendations are real and open | 100% sourced from Google Places, never invented |
-| End-to-end response time | ≤ 4 seconds (landmark mode excludes image transfer, see §6) |
-| BLE connection stability | < 1 drop per 30-minute session |
-| Session save success rate | ≥ 99% |
-| Crash-free sessions | ≥ 95% |
+| Metric | Target | Status |
+|---|---|---|
+| Landmark identification accuracy | ≥ 90% for top 20 landmarks | To be measured |
+| Spoken question understood correctly | ≥ 90% of requests | To be measured |
+| Backend response time (question sent → answer returned) | ≤ 4 seconds | **Median 4.1s measured** (see §7.1) |
+| Photograph transfer over Bluetooth | measured separately | ~5–6 seconds |
+| BLE connection stability | < 1 drop per 30-minute session | To be measured |
+| Crash-free sessions | ≥ 95% | To be measured |
+| Recommendation relevance | — | N/A — F06 not implemented |
+| Session save success rate | — | N/A — F09 not implemented |
+
+### 7.1 Measured: Model Selection and Response Time
+
+Response time was initially 28–80 seconds, far outside target. Each suspected cause
+was eliminated by measurement rather than assumption:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Search grounding is the cost | Disabled it | Still 28.6s — **not the cause** |
+| Model "thinking" is the cost | `thinkingBudget=0` | Saved ~4s — not the cause |
+| Long output is the cost | 94 output tokens took 25s | Not the cause |
+| **Free-tier capacity** | Compared model variants on identical input | **Confirmed** |
+
+Same photograph, same prompt, image and audio together:
+
+| Model | Response time | Identified correctly |
+|---|---|---|
+| `gemini-2.5-flash` | ~28s (503 errors common) | ✓ |
+| `gemini-3.5-flash` | 5.9s | ✓ |
+| `gemini-3.5-flash-lite` | 5.1s | ✓ |
+
+`gemini-3.5-flash-lite` was adopted, pinned rather than using a `-latest` alias so
+results remain reproducible. Measured through the live endpoint afterwards: 4.1s
+median across five runs (min 3.3s, max 9.9s), 5/5 successful.
+
+Search grounding was retained for follow-up questions only — it was not the latency
+cause, but it is billed per request and does not assist image recognition.
 
 ---
 
@@ -224,8 +305,10 @@ So that the app suggests options rather than requiring me to name a dish.
 | **Assumption** | Tourist has mobile data (4G minimum) while walking in Malacca |
 | **Risk** | HeyCyan SDK BLE errors may delay glasses integration |
 | **Mitigation** | Build and validate backend + app with phone camera first; add glasses last |
-| **Risk** | Gemini preview models may have rate limits or be deprecated |
-| **Mitigation** | Use stable `gemini-2.5-flash` for vision; upgrade Live model when stable |
+| **Risk** | Gemini free-tier models suffer capacity limits and rate limiting |
+| **Mitigation** | Model choice made empirically (§7.1); `gemini-2.5-flash` was abandoned after measuring ~28s responses and frequent 503s. Rate-limit (429) responses are reported honestly rather than as an image problem |
+| **Risk** | Paid APIs may become unavailable mid-project |
+| **Realised** | Google Places trial billing expired, blocking F06/F07 entirely (§3.5). Gemini was unaffected as its free tier is independent of Cloud billing |
 | **Risk** | Landmark recognition may fail at odd angles or at night |
 | **Mitigation** | Add fallback prompt: "I could not identify this clearly, try a closer angle" |
 | **Risk** | An LLM asked to name restaurants may invent places, or list ones long closed |

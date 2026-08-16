@@ -1,12 +1,18 @@
 # System Design Document (SDD)
 # HeyCyan Malacca Tourist Guide App
 
-**Version:** 2.1  
+**Version:** 2.2  
 **Date:** August 2026  
 **Author:** [Your Name]  
 **Status:** Draft  
 **Related:** prd.md
 
+> **Revision note (v2.2).** Corrected against the code. The vision model is now
+> `gemini-3.5-flash-lite` (§2.1, §8) following the measurements in PRD §7.1. §5.3
+> (restaurant) is **specified but not implemented** — see PRD §3.5. Folder structures
+> in §4 now list files that exist. Firestore, Room, session history and Cloud Run
+> deployment are **not implemented**.
+>
 > **Revision note (v2.1).** Updated to match the implementation. Restaurant mode is
 > now a voice-driven recommendation rather than signage identification (§5.3); the
 > voice pipeline records audio and lets Gemini interpret it instead of using a
@@ -39,13 +45,13 @@ Android frontend must be fully tested with phone camera before glasses BLE is ad
 |---|---|
 | Language | Python 3.11+ |
 | Framework | FastAPI |
-| Vision + LLM | Gemini 2.5 Flash (`gemini-2.5-flash`) |
-| Speech understanding | Gemini 2.5 Flash — the recorded question is sent as an audio part alongside the image; no separate speech-to-text service |
+| Vision + LLM | **`gemini-3.5-flash-lite`** (the `VISION_MODEL` constant). Chosen by measurement — see PRD §7.1 |
+| Speech understanding | Same model — the recorded question is sent as an audio part alongside the image; no separate speech-to-text service |
 | TTS | Android `TextToSpeech`, routed to the glasses speaker |
-| Web search | Google Search grounding, enabled as a Gemini tool |
-| Database | Firebase Firestore |
-| Image storage | Firebase Cloud Storage |
-| Hosting | Google Cloud Run |
+| Web search | Google Search grounding as a Gemini tool, **enabled for follow-ups only** |
+| Database | *Not implemented* (Firestore was planned; Phase 4 not reached) |
+| Image storage | *Not implemented* |
+| Hosting | *Not deployed* — runs locally via uvicorn; no Dockerfile exists |
 | Environment | Python venv + `.env` file |
 
 ### 2.2 Android App
@@ -60,18 +66,18 @@ Android frontend must be fully tested with phone camera before glasses BLE is ad
 | Audio capture | `AudioRecord` with `setPreferredDevice` pinned to the glasses microphone, written to WAV and uploaded. Replaced Android `SpeechRecognizer`, which chose the phone microphone regardless of routing and returned `NO_MATCH` on clean Bluetooth audio — see §10.4 |
 | Audio routing | `AudioManager.setCommunicationDevice` (API 31+) / Bluetooth SCO, pinning capture and playback to the glasses |
 | TTS | Android `TextToSpeech` with `USAGE_VOICE_COMMUNICATION` so playback follows the pinned route |
-| State management | ViewModel + StateFlow |
-| Local cache | Room Database |
-| Auth | Firebase Auth (anonymous) |
-| Min SDK | API 26 (Android 8.0) |
+| State management | ViewModel + Compose `mutableStateOf` |
+| Local cache | *Not implemented* (Room is declared as a dependency but unused) |
+| Auth | *Not implemented* |
+| Min SDK | API 29 (Android 10) — raised from the planned API 26 because the audio-routing APIs the glasses require are not available below it |
 
 ### 2.3 External APIs
-| API | Purpose | Key needed |
-|---|---|---|
-| Google Gemini API | Vision, LLM, STT, TTS | `GEMINI_API_KEY` |
-| Google Custom Search | Web search for current info | `GOOGLE_SEARCH_API_KEY` + `SEARCH_ENGINE_ID` |
-| Google Places API (New) | Restaurant rating, reviews, nearby search | `GOOGLE_PLACES_API_KEY` |
-| Firebase | Firestore + Cloud Storage | Service account JSON |
+| API | Purpose | Key needed | Status |
+|---|---|---|---|
+| Google Gemini API | Vision, speech understanding, answer generation | `GEMINI_API_KEY` | ✅ In use (free tier) |
+| Google Search grounding | Current info on follow-ups | Built into Gemini tool use | ✅ In use |
+| Google Places API (New) | Restaurant ratings, nearby search | `GOOGLE_PLACES_API_KEY` | ❌ **Unavailable** — returns `403 PERMISSION_DENIED`, trial billing expired (PRD §3.5) |
+| Firebase | Firestore + Cloud Storage | Service account JSON | ❌ Not implemented |
 
 ---
 
@@ -79,55 +85,54 @@ Android frontend must be fully tested with phone camera before glasses BLE is ad
 
 ```
 [HeyCyan Glasses]
-    |  BLE (photo data, audio)
+    |  BLE      -> button event, photo (chunked)
+    |  Classic BT (HFP) -> microphone audio
     v
 [Android App — Kotlin]
-    |  captures image + voice
-    |  STT via Gemini Live API (WebSocket)
-    |  sends HTTP POST to backend
-    |
+    |  pulls the JPEG over BLE (two-phase, reassembled)
+    |  records the question via AudioRecord, pinned to the glasses mic -> WAV
+    |  NO on-device speech-to-text
+    |  sends image + audio in ONE multipart POST
     v
-[FastAPI Backend — Python]        <——> [Gemini 2.5 Flash] (vision + LLM)
-    |                             <——> [Google Search API] (current info)
-    |  saves session
-    v
-[Firebase Firestore]   [Firebase Cloud Storage]
-    (session metadata)     (raw images)
-
-[FastAPI Backend]
-    |  returns JSON response text
+[FastAPI Backend — Python]  <——> [gemini-3.5-flash-lite]
+    |                             image + audio in a single call
+    |                        <——> [Google Search grounding]  (follow-ups only)
+    |  parses LANDMARK / CONFIDENCE headers, strips them
     v
 [Android App]
-    |  TTS (speak response)
+    |  Android TextToSpeech, USAGE_VOICE_COMMUNICATION
     v
 [HeyCyan Glasses Speaker]
+    |
+    v
+ cue tone -> listen for a spoken follow-up -> repeat
 ```
+
+Not implemented: session persistence, Firestore, Cloud Storage, cloud hosting.
 
 ---
 
 ## 4. Folder Structure
 
-### 4.1 Backend (`malacca-backend/`)
+### 4.1 Backend (`backend/`) — as built
 ```
-malacca-backend/
+backend/
 ├── main.py                  # FastAPI app entry point
-├── requirements.txt         # Python dependencies
-├── .env                     # API keys (never commit to git)
-├── .gitignore
-├── Dockerfile               # For Cloud Run deployment
+├── requirements.txt
+├── .env                     # gitignored, untracked
+├── routers/
+│   ├── analyze.py           # POST /analyze  (image + optional audio)
+│   └── restaurant.py        # POST /restaurant, /restaurant/nearby — BLOCKED
 ├── services/
-│   ├── __init__.py
-│   ├── vision.py            # Gemini vision call (landmark ID)
-│   ├── search.py            # Google Search API wrapper
-│   ├── places.py            # Google Places API wrapper (restaurant details + nearby search)
-│   └── database.py          # Firestore read/write
+│   ├── vision.py            # VISION_MODEL, prompt, header parsing
+│   ├── search.py            # Google Search grounding tool
+│   └── places.py            # Places wrapper — non-functional, billing expired
 ├── models/
-│   ├── __init__.py
 │   └── schemas.py           # Pydantic request/response models
 └── tests/
-    ├── test_vision.py
-    └── test_api.py
+    └── test_vision.py
 ```
+Planned but never created: `Dockerfile`, `services/database.py`, `tests/test_api.py`.
 
 ### 4.2 Android App (`malacca-android/`)
 ```
@@ -148,16 +153,12 @@ malacca-android/
 │   │       │   │   └── NavGraph.kt    # All screen routes
 │   │       │   ├── screens/
 │   │       │   │   ├── SplashScreen.kt     # Launch screen
-│   │       │   │   ├── HomeScreen.kt       # Main tourist UI
-│   │       │   │   ├── ListeningScreen.kt  # Active voice input UI
+│   │       │   │   ├── HomeScreen.kt       # Main tourist UI + glasses status
+│   │       │   │   ├── ListeningScreen.kt  # Records the question
 │   │       │   │   ├── LoadingScreen.kt    # Waiting for AI response
-│   │       │   │   ├── ResultScreen.kt     # Show landmark + AI response
-│   │       │   │   └── HistoryScreen.kt    # Past sessions list (Phase 4)
+│   │       │   │   └── ResultScreen.kt     # Answer + hands-free follow-up window
 │   │       │   └── components/
-│   │       │       ├── PulseButton.kt      # Animated mic button
-│   │       │       ├── WaveformView.kt     # Audio waveform animation
-│   │       │       ├── LandmarkCard.kt     # Result card component
-│   │       │       └── ErrorBanner.kt      # Error message component
+│   │       │       └── BatteryIndicator.kt # Glasses battery, drawn to level
 │   │       ├── ble/
 │   │       │   ├── GlassesManager.kt       # Scan, connect, capture, device events
 │   │       │   ├── ConnectionState.kt      # BLE connection state enum
@@ -176,19 +177,14 @@ malacca-android/
 │   │       │   ├── Earcon.kt               # Cue tone when the follow-up window opens
 │   │       │   └── TtsManager.kt           # Text-to-speech manager
 │   │       ├── camera/
-│   │       │   └── CameraManager.kt        # CameraX wrapper (Phase 2)
-│   │       ├── data/
-│   │       │   ├── SessionRepository.kt    # Single source of truth
-│   │       │   └── local/
-│   │       │       ├── AppDatabase.kt      # Room DB setup
-│   │       │       ├── SessionDao.kt       # Room queries
-│   │       │       └── SessionEntity.kt    # Room table definition
+│   │       │   └── CameraManager.kt        # CameraX fallback when no glasses
 │   │       └── viewmodel/
-│   │           └── MainViewModel.kt        # All screen state + logic
+│   │           └── GuideViewModel.kt       # All screen state + logic
 │   └── build.gradle
-├── build.gradle
-└── google-services.json      # Firebase config (never commit to git)
+└── build.gradle
 ```
+Planned but never created: `HistoryScreen.kt`, the `data/` package (Room), the four
+UI components above, `google-services.json` (no Firebase integration).
 
 ---
 
@@ -248,7 +244,14 @@ Health check endpoint for Cloud Run.
 
 ---
 
-### 5.3 `POST /restaurant`
+### 5.3 `POST /restaurant` — SPECIFIED, NOT IMPLEMENTED
+
+> ⚠️ **This design was never built.** The code in `routers/restaurant.py` is still the
+> earlier signage-OCR implementation, and it cannot run: Google Places returns
+> `403 PERMISSION_DENIED` because the project's trial billing expired. See PRD §3.5
+> for the evaluation of free alternatives and the decision to withdraw the feature.
+> The section is retained as a record of the intended design.
+
 Accepts a **recorded spoken request** plus the tourist's GPS position, and returns
 nearby places matching what they asked for. **No image is involved** — see PRD §3.4
 for why this replaced signage identification.
@@ -439,12 +442,17 @@ GEMINI_API_KEY=your_gemini_api_key_here
 
 | Feature | Model | API Type | Notes |
 |---|---|---|---|
-| Landmark identification | `gemini-2.5-flash` | REST (multimodal) | Stable, production-safe |
-| LLM answer generation | `gemini-2.5-flash` | REST | Same call as vision |
-| Voice input | `gemini-2.5-flash` | REST (audio part) | The recording is sent with the image; Gemini answers the spoken question directly. No separate STT service — Android's on-device recogniser returned `NO_MATCH` on clean Bluetooth audio |
-| Request interpretation (restaurant) | `gemini-2.5-flash` | REST (audio part) | Turns the spoken request into a structured Places search. Never names restaurants itself |
+| Landmark identification | `gemini-3.5-flash-lite` | REST (multimodal) | Image + audio in one call. Model pinned, not a `-latest` alias, so results stay reproducible |
+| Answer generation | same call | REST | One request produces identification and answer together |
+| Voice input | same call | REST (audio part) | The recording is sent with the image; Gemini answers the spoken question directly. No STT service — Android's on-device recogniser returned `NO_MATCH` on Bluetooth audio later verified clean |
 | Voice output (TTS) | Android `TextToSpeech` | on-device | Routed to the glasses speaker; no cloud TTS needed |
-| Web search grounding | Built into Gemini tool use | REST | Enable `google_search` tool |
+| Web search grounding | Gemini tool use | REST | **Follow-ups only.** Omitted for identification: recognition is a vision task the text-query search tool cannot assist with, and grounding is billed per request |
+| Request interpretation (restaurant) | — | — | Not implemented |
+
+**Model selection was empirical.** `gemini-2.5-flash` averaged ~28s with frequent
+503s on the free tier; search grounding and model thinking were both eliminated as
+causes by measurement before capacity was identified. See PRD §7.1 for the full
+comparison.
 
 ---
 
@@ -736,10 +744,13 @@ TTS finishes speaking
 Cue tone through the glasses (Earcon)
     |
     v
-Wait ~450ms so the tone is not recorded    <-- the glasses mic sits inches
+Re-pin the audio route (it is torn down when playback ends)
+    |
+    v
+Wait 520ms so the tone is not recorded     <-- the glasses mic sits inches
     |                                          from the glasses speaker
     v
-Listen for up to 4 seconds
+Listen for up to 7 seconds
     |
     +-- speech heard  --> follow-up: reuse the image and landmarkContext,
     |                     skip the capture, go to LoadingScreen
@@ -755,10 +766,16 @@ Design decisions worth recording:
   pressing to restart are two actions that never compete.
 - **No cue tone after a failure.** A backend or AI error still returns a result
   object; offering a follow-up about a failure is worse than staying silent.
-- **Speech detection is level-based**, calibrated against the room's noise floor with
-  an absolute minimum. On this hardware a spoken question peaks near 27000 while
-  Bluetooth idle hiss reaches 2500, so a permissive threshold made the cue tone
-  trigger a follow-up by itself.
+- **Speech detection is level-based**, calibrated against the room's noise floor,
+  requiring several consecutive frames above threshold. Tuning it required measured
+  data: one recorded question peaked at 27000, another at only 1946 — quieter than
+  the cue tone itself. A fixed threshold could not separate the two, so detection is
+  driven by the ratio to the measured noise floor rather than an absolute level.
+- **The route must be re-established before each window.** The system tears down
+  Bluetooth SCO when playback ends, so after a long answer both the cue tone and the
+  recording went to a dead link, producing a recording with a peak amplitude of zero.
+- **7 seconds, not 4.** A recording showed the wearer beginning to speak 2.8s after
+  the tone; a 4-second window captured barely a second of the question.
 
 ---
 
@@ -921,8 +938,8 @@ Every screen must handle these gracefully (never crash):
 | No internet | HomeScreen | ErrorBanner at bottom: "No internet. Check your connection." |
 | Mic permission denied | HomeScreen | ErrorBanner: "Microphone permission needed. Go to Settings." |
 | Camera permission denied | HomeScreen | ErrorBanner: "Camera permission needed. Go to Settings." |
-| STT heard nothing | ListeningScreen | Toast: "I didn't catch that. Try again." → back to Home |
-| Backend timeout (>10s) | LoadingScreen | Auto-navigate Home: "Connection timeout. Try again." |
+| No speech captured | ListeningScreen | Proceeds with the default question rather than discarding the photograph, which is the expensive part of the interaction |
+| Gemini rate limit (429) | LoadingScreen | "Too many requests right now. Please wait a moment." Deliberately distinguished from a bad image — the earlier message told the tourist to retake a perfectly good photograph |
 | Low confidence landmark | ResultScreen | Amber badge + "Try a clearer angle next time" |
 | Unknown landmark | ResultScreen | Red badge + "I couldn't identify this landmark." |
 | BLE disconnected | HomeScreen | Bottom indicator updates to "Glasses disconnected" |
@@ -1105,13 +1122,21 @@ in the current phase pass.
 | 2.14 | Display response on ResultScreen | Landmark name + AI text shows correctly |
 | 2.15 | Show captured image thumbnail on ResultScreen | Image preview visible in LandmarkCard |
 
-#### 2D — Voice Input (STT)
+#### 2D — Voice Input
 | Step | Task | Success Check |
 |---|---|---|
-| 2.16 | Create `SttManager.kt` with Android SpeechRecognizer | Voice transcribed to text on device |
-| 2.17 | Wire STT result → query field in `/analyze` call | Spoken question sent as query to backend |
-| 2.18 | Navigate Listening → Loading on speech end | Automatic transition when tourist stops speaking |
-| 2.19 | Handle empty STT result gracefully | Toast shown, navigate back to Home |
+| 2.16 | ~~`SttManager.kt` with Android SpeechRecognizer~~ **Superseded** | Built, then removed — see 2.16b |
+| 2.16b | `VoiceRecorder.kt` — own `AudioRecord` capture to WAV | Recording saved; speech start/end detected without SpeechRecognizer |
+| 2.17 | Upload the WAV with the image in one `/analyze` call | Gemini answers the spoken question directly |
+| 2.18 | Navigate Listening → Loading when speech ends | Automatic transition after trailing silence |
+| 2.19 | Handle silence gracefully | Proceeds with the default question rather than discarding the photograph |
+
+**Why 2.16 was replaced.** Android's `SpeechRecognizer` runs out of process and
+selected the phone's built-in microphone regardless of the routing request, then
+returned `NO_MATCH` with no partial results on 2+ seconds of speech. Inspecting the
+recorded waveform showed clean audio — 2.3s of well-levelled speech peaking at 27000
+of 32767 — proving the recogniser, not the Bluetooth link, was at fault. Owning the
+capture allows `setPreferredDevice()` to name the glasses microphone explicitly.
 
 #### 2E — Voice Output (TTS)
 | Step | Task | Success Check |
@@ -1164,16 +1189,23 @@ in the current phase pass.
 | 3.2 | Add AAR dependency in `build.gradle` | Project builds without AAR errors |
 | 3.3 | Add all BLE permissions to `AndroidManifest.xml` | No permission-related build errors |
 | 3.4 | Create `GlassesManager.kt` — BLE scan | Nearby glasses appear in a list |
-| 3.5 | Implement connect + disconnect logic | App connects to glasses, HomeScreen shows "Glasses connected ✓" |
-| 3.6 | Implement `QCSDKManagerDelegate` photo callback | Callback fires when glasses shutter pressed |
-| 3.7 | Replace `CameraManager` with glasses photo bytes | Photo from glasses sent to `/analyze` |
-| 3.8 | Test full flow with glasses | Tourist speaks → glasses capture → AI response spoken back |
-| 3.9 | Test BLE drop recovery | Glasses disconnect → HomeScreen shows "Glasses disconnected" gracefully |
-| ✅ | **Phase 3 complete when:** | Full flow works with glasses. App handles BLE drops without crashing. |
+| 3.5 | Implement connect + disconnect logic | App connects; HomeScreen shows "Glasses connected" |
+| 3.6 | Register a `GlassesDeviceNotifyListener`; decode the event codes | Temple button raises `0x01` with an incrementing image count (§10.3) |
+| 3.7 | Implement the two-phase chunked thumbnail pull with reassembly | 1088×816 JPEG decodes successfully (§10.4) |
+| 3.8 | Route audio to the glasses mic and speaker | `onReadyForSpeech` reports the glasses device, not the phone (§10.5) |
+| 3.9 | Drive the whole session from the temple button | Press → photo → question → spoken answer, phone untouched |
+| 3.10 | Hands-free spoken follow-ups (F16) | Cue tone, then a spoken question continues the conversation |
+| 3.11 | Test BLE drop recovery | Glasses disconnect → status updates; on-screen controls reappear |
+| ✅ | **Phase 3 complete when:** | Full flow works with glasses. App handles BLE drops without crashing. **Achieved.** |
 
 ---
 
-### Phase 4 — Database + Session History
+### Phase 4 — Database + Session History — ❌ NOT IMPLEMENTED
+**Status:** Not reached. Effort was directed at completing and validating the glasses
+integration (Phase 3), which is where the project's contribution lies. No Firestore,
+Room persistence, session saving or history screen exists. Retained below as the
+intended design.
+
 **Tool:** VS Code + Android Studio  
 **Glasses needed:** Optional  
 **Goal:** Every interaction saved, tourist can review past discoveries
@@ -1195,15 +1227,15 @@ in the current phase pass.
 ---
 
 ### Phase 5 — Polish + Nice-to-Have
-| Step | Feature | Notes |
+| Step | Feature | Status |
 |---|---|---|
-| 5.1 | Upgrade STT to Gemini Live API (WebSocket) | Replace Android SpeechRecognizer — lower latency |
-| 5.2 | Upgrade TTS to Gemini TTS API | Replace Android TextToSpeech — more natural voice |
-| 5.3 | Multilingual response | Pass `language` param; detect from device locale |
-| 5.4 | Offline landmark cache | Pre-load top 20 landmarks into Room DB |
-| 5.5 | Map integration | Show Google Maps pin after landmark identified |
-| 5.6 | Feedback (thumbs up/down) | Save rating to Firestore session document |
-| 5.7 | Cloud Run deployment | Dockerize backend, deploy to GCP, update Android URL |
+| 5.1 | Replace Android SpeechRecognizer | ✅ **Done, differently** — audio is sent to Gemini directly rather than via the Live API, removing the STT layer entirely (see 2D) |
+| 5.2 | Upgrade TTS to Gemini TTS API | Not done — Android `TextToSpeech` proved sufficient and needs no network |
+| 5.3 | Multilingual response | ✅ Partial — English and Bahasa Melayu |
+| 5.4 | Offline landmark cache | Not done |
+| 5.5 | Map integration | Not done |
+| 5.6 | Feedback (thumbs up/down) | Not done |
+| 5.7 | Cloud deployment | Not done — no Dockerfile; runs locally. Google Cloud Run requires billing that was unavailable; free alternatives identified but not pursued |
 
 ---
 
