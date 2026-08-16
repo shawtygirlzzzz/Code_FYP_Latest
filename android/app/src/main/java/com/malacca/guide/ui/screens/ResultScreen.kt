@@ -116,10 +116,18 @@ private fun LandmarkResultScreen(
     var awaitingFollowUp by remember { mutableStateOf(false) }
 
     LaunchedEffect(responseText) {
+        // Starting a follow-up clears the answer before navigating away, so this
+        // screen briefly recomposes with no result and responseText falls back to
+        // its placeholder. Speaking that means the wearer hears "No response
+        // received" immediately after asking their question. Genuine error
+        // messages still carry text and are still spoken.
+        val spoken = result?.response ?: result?.message
+        if (spoken.isNullOrBlank()) return@LaunchedEffect
+
         // Make sure the answer comes out of the glasses, not the phone.
         GlassesAudioRouter.activate()
         speechFinished = false
-        ttsManager.speak(responseText, viewModel.selectedLanguage) { speechFinished = true }
+        ttsManager.speak(spoken, viewModel.selectedLanguage) { speechFinished = true }
     }
 
     LaunchedEffect(speechFinished) {
