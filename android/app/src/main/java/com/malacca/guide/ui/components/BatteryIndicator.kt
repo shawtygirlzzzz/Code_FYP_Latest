@@ -79,12 +79,14 @@ fun BatteryIndicator(
         }
 
         if (showLabel) {
+            // No fixed height here: a 13.sp line box needs ~18dp, so pinning it to
+            // 16dp clipped the text. Let it size itself.
             Text(
                 text = "$level%",
                 color = color,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.height(16.dp)
+                maxLines = 1
             )
         }
     }

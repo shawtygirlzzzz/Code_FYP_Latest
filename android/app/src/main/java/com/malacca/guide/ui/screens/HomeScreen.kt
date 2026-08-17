@@ -449,7 +449,17 @@ fun HomeScreen(navController: NavController, viewModel: GuideViewModel) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(text = glassesText, color = glassesColor, fontSize = 13.sp)
+                        // Weighted so the longest label ("Connected (tap to
+                        // disconnect)") gives way instead of squeezing the battery
+                        // readout off the right edge and clipping the "%".
+                        Text(
+                            text = glassesText,
+                            color = glassesColor,
+                            fontSize = 13.sp,
+                            modifier = Modifier
+                                .weight(1f, fill = false)
+                                .padding(end = 8.dp)
+                        )
                         // Reported by the glasses on event 0x05, and prompted via
                         // addBatteryCallBack + syncBattery() on connect.
                         battery?.let { BatteryIndicator(percent = it) }
