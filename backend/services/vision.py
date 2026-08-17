@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 # reproducible: an alias silently moves to a different model over time.
 VISION_MODEL = "gemini-3.5-flash-lite"
 
+# Follow-ups run on a different model because search grounding is not available
+# to this project on the 3.x family. Measured directly against the same key:
+#   gemini-3.5-flash-lite    + search -> 429 RESOURCE_EXHAUSTED in 0.2s
+#   gemini-3.5-flash         + search -> 429 RESOURCE_EXHAUSTED in 0.1s
+#   gemini-flash-lite-latest + search -> 429 RESOURCE_EXHAUSTED in 0.1s
+#   gemini-2.5-flash         + search -> 200 OK in 2.8s, 1 search query issued
+# The same 3.5-flash-lite request *without* the tool answers in 0.9s, so the
+# ungrounded quota is healthy — it is the grounding allowance specifically that
+# is refused, and the rejection arrives too fast to be capacity or congestion.
+FOLLOW_UP_MODEL = "gemini-2.5-flash"
+
 SYSTEM_PROMPT = """You are HeyCyan, an expert AI tourist guide specialising in Malacca (Melaka), Malaysia.
 You know Malacca's landmarks, museums, temples, mosques, streets and monuments well. Google
 Search is available when answering follow-up questions, where current details such as ticket
@@ -121,15 +132,18 @@ def analyze_landmark(
 
     Returns dict with landmark_name, response, confidence.
     """
-    client = get_gemini_client()
-
     lang_name = LANGUAGE_NAMES.get(language, "English")
     base_query = query if query else "What is this landmark? Tell me about it."
     if audio_bytes:
+        # The no-question fallback differs by path: identification still has the
+        # photograph to fall back on, follow-ups no longer carry one.
+        fallback = (
+            f"briefly say something useful about {landmark_context}"
+            if landmark_context else "simply describe the landmark in the image"
+        )
         base_query = (
             "The tourist's question is in the attached audio clip. Listen to it and "
-            "answer it directly. If the audio is unclear or contains no question, "
-            "simply describe the landmark in the image."
+            f"answer it directly. If the audio is unclear or contains no question, {fallback}."
         )
 
     if landmark_context:
@@ -165,26 +179,15 @@ def analyze_landmark(
     # information genuinely lives — ticket prices, opening hours — so the tool is
     # given only when a landmark_context marks the request as a follow-up.
     use_search = bool(landmark_context)
-    tools = [build_search_tool()] if use_search else None
     logger.info(
         "analyze_landmark: follow_up=%s search_grounding=%s audio=%s",
-        bool(landmark_context), use_search, bool(audio_bytes),
+        use_search, use_search, bool(audio_bytes),
     )
 
-    started = time.perf_counter()
-    response = client.models.generate_content(
-        model=VISION_MODEL,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.4,
-            tools=tools,
-        ),
-        contents=_build_contents(image_bytes, user_prompt, audio_bytes, audio_mime),
-    )
-    logger.info(
-        "analyze_landmark: Gemini responded in %.1fs (search_grounding=%s)",
-        time.perf_counter() - started, use_search,
-    )
+    if use_search:
+        response = _follow_up(user_prompt, audio_bytes, audio_mime)
+    else:
+        response = _identify(image_bytes, user_prompt, audio_bytes, audio_mime)
 
     raw_text = response.text.strip().replace("**", "")
     landmark_name, confidence, spoken_text = _parse_response(raw_text)
@@ -196,13 +199,94 @@ def analyze_landmark(
     }
 
 
-def _build_contents(
+def _identify(
     image_bytes: bytes,
     user_prompt: str,
     audio_bytes: bytes | None,
     audio_mime: str,
+):
+    """First question about a landmark: photograph in, no search tool."""
+    started = time.perf_counter()
+    response = get_gemini_client().models.generate_content(
+        model=VISION_MODEL,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.4,
+        ),
+        contents=_build_contents(image_bytes, user_prompt, audio_bytes, audio_mime),
+    )
+    logger.info(
+        "analyze_landmark: %s identified in %.1fs",
+        VISION_MODEL, time.perf_counter() - started,
+    )
+    return response
+
+
+def _follow_up(user_prompt: str, audio_bytes: bytes | None, audio_mime: str):
+    """
+    Follow-up question: search tool on, and no photograph.
+
+    The image is deliberately dropped. The landmark is already known — it is
+    named in the prompt, which also forbids re-identifying it — so the photo
+    contributes nothing, and attaching it alongside the search tool is
+    ruinously slow. Measured on gemini-2.5-flash, same question, same key:
+        with image    44.8s / 47.5s / 44.4s   (median 44.8s)
+        without image  3.2s /  3.1s / 24.9s   (median  3.2s)
+    Both searched and both answered correctly; the image only added latency,
+    and 45s of silence would have broken the hands-free follow-up window.
+
+    Falls back to an ungrounded answer if grounding is refused, so a spent
+    search allowance costs currency rather than the whole reply.
+    """
+    started = time.perf_counter()
+    try:
+        response = get_gemini_client().models.generate_content(
+            model=FOLLOW_UP_MODEL,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.4,
+                tools=[build_search_tool()],
+            ),
+            contents=_build_contents(None, user_prompt, audio_bytes, audio_mime),
+        )
+        logger.info(
+            "analyze_landmark: %s answered follow-up in %.1fs (grounded)",
+            FOLLOW_UP_MODEL, time.perf_counter() - started,
+        )
+        return response
+    except Exception as e:
+        logger.warning(
+            "analyze_landmark: grounded follow-up on %s failed after %.1fs (%s: %s) "
+            "— retrying ungrounded on %s",
+            FOLLOW_UP_MODEL, time.perf_counter() - started,
+            type(e).__name__, getattr(e, "code", None), VISION_MODEL,
+        )
+
+    started = time.perf_counter()
+    response = get_gemini_client().models.generate_content(
+        model=VISION_MODEL,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.4,
+        ),
+        contents=_build_contents(None, user_prompt, audio_bytes, audio_mime),
+    )
+    logger.info(
+        "analyze_landmark: %s answered follow-up in %.1fs (ungrounded fallback)",
+        VISION_MODEL, time.perf_counter() - started,
+    )
+    return response
+
+
+def _build_contents(
+    image_bytes: bytes | None,
+    user_prompt: str,
+    audio_bytes: bytes | None,
+    audio_mime: str,
 ) -> list:
-    parts = [types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")]
+    parts = []
+    if image_bytes:
+        parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
     if audio_bytes:
         parts.append(types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime))
     parts.append(types.Part.from_text(text=user_prompt))
